@@ -48,6 +48,8 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -83,6 +85,16 @@
                                            genome and read data already in memory. */
 #define KMER_TABLE_SIZE      (1u << KMER_TABLE_BITS)
 #define KMER_TABLE_MASK      (KMER_TABLE_SIZE - 1)
+#define SPLICE_TABLE_BITS         20   /* the splice-anchor index's key space is only
+                                           4^SPLICE_KMER_LEN = 4^10 = 1,048,576 distinct
+                                           10-mers, regardless of genome size -- reusing
+                                           the much larger main-index table size here
+                                           bought nothing (already <1 collision/bucket at
+                                           this size for that key space) and wasted
+                                           ~120MB. Sized to the splice index's own actual
+                                           key space instead. */
+#define SPLICE_TABLE_SIZE    (1u << SPLICE_TABLE_BITS)
+#define SPLICE_TABLE_MASK    (SPLICE_TABLE_SIZE - 1)
 #define MAX_SEED_HITS_PER_KMER    64   /* cap on repetitive k-mers, like repeat-masking */
 #define MAX_MISMATCHES              2   /* ungapped alignment */
 #define SPLICE_MAX_MISMATCHES       3   /* combined across both exon blocks */
@@ -362,8 +374,8 @@ typedef struct KmerEntry {
     struct KmerEntry *next;
 } KmerEntry;
 
-static KmerEntry *kmer_table[KMER_TABLE_SIZE];        /* main index, k = KMER_LEN */
-static KmerEntry *kmer_table_splice[KMER_TABLE_SIZE];  /* splice-anchor index, k = SPLICE_KMER_LEN */
+static KmerEntry *kmer_table[KMER_TABLE_SIZE];               /* main index, k = KMER_LEN */
+static KmerEntry *kmer_table_splice[SPLICE_TABLE_SIZE];       /* splice-anchor index, k = SPLICE_KMER_LEN */
 
 /* Bump-allocator arena for KmerEntry structs and their initial (cap=2) hits
  * arrays. Index-building never frees an individual entry (the whole index
@@ -415,15 +427,15 @@ static int encode_kmer(const char *s, int len, uint32_t *out) {
     return 1;
 }
 
-static uint32_t hash_kmer(uint32_t k) {
+static uint32_t hash_kmer(uint32_t k, uint32_t mask) {
     k ^= k >> 16; k *= 0x7feb352dU;
     k ^= k >> 15; k *= 0x846ca68bU;
     k ^= k >> 16;
-    return k & KMER_TABLE_MASK;
+    return k & mask;
 }
 
-static void kmer_index_add(KmerEntry **table, uint32_t kmer, int chrom_idx, long pos) {
-    uint32_t h = hash_kmer(kmer);
+static void kmer_index_add(KmerEntry **table, uint32_t mask, uint32_t kmer, int chrom_idx, long pos) {
+    uint32_t h = hash_kmer(kmer, mask);
     KmerEntry *e = table[h];
     while (e && e->kmer != kmer) e = e->next;
     if (!e) {
@@ -459,21 +471,21 @@ static void kmer_index_add(KmerEntry **table, uint32_t kmer, int chrom_idx, long
     }
 }
 
-static KmerEntry *kmer_index_lookup(KmerEntry **table, uint32_t kmer) {
-    uint32_t h = hash_kmer(kmer);
+static KmerEntry *kmer_index_lookup(KmerEntry **table, uint32_t mask, uint32_t kmer) {
+    uint32_t h = hash_kmer(kmer, mask);
     KmerEntry *e = table[h];
     while (e && e->kmer != kmer) e = e->next;
     return e;
 }
 
-static void build_kmer_index_generic(KmerEntry **table, int k, const char *label) {
+static void build_kmer_index_generic(KmerEntry **table, uint32_t mask, int k, const char *label) {
     long total_kmers = 0;
     for (int ci = 0; ci < n_chroms; ci++) {
         Chrom *c = &chroms[ci];
         for (long p = 0; p + k <= c->len; p++) {
             uint32_t kmer;
             if (encode_kmer(c->seq + p, k, &kmer)) {
-                kmer_index_add(table, kmer, ci, p);
+                kmer_index_add(table, mask, kmer, ci, p);
                 total_kmers++;
             }
         }
@@ -482,8 +494,221 @@ static void build_kmer_index_generic(KmerEntry **table, int k, const char *label
 }
 
 static void build_kmer_index(void) {
-    build_kmer_index_generic(kmer_table, KMER_LEN, "main k-mer");
-    build_kmer_index_generic(kmer_table_splice, SPLICE_KMER_LEN, "splice-anchor k-mer");
+    build_kmer_index_generic(kmer_table, KMER_TABLE_MASK, KMER_LEN, "main k-mer");
+    build_kmer_index_generic(kmer_table_splice, SPLICE_TABLE_MASK, SPLICE_KMER_LEN, "splice-anchor k-mer");
+}
+
+/* ---------------------------------------------------------------------- */
+/* On-disk index cache (reference FASTA -> chrom sequences + both k-mer   */
+/* tables), so repeated runs against the SAME reference skip re-parsing   */
+/* the FASTA and rebuilding the index from scratch.                      */
+/*                                                                        */
+/* This is the single largest remaining lever after this session's other */
+/* fixes: build_kmer_index_generic profiled at 35-83% of total runtime    */
+/* depending on read-count scale, yet it does the exact same, input-      */
+/* independent work every single run. A real RNA-seq workflow aligns many */
+/* samples against one unchanged reference genome -- BWA reflects this by */
+/* splitting `bwa index` (one-time) from `bwa mem` (per-sample); this adds*/
+/* the equivalent for this pipeline without requiring a separate command. */
+/*                                                                        */
+/* Cache validity is checked via the reference file's (size, mtime) plus  */
+/* the compile-time index parameters (KMER_LEN, SPLICE_KMER_LEN, table    */
+/* sizes, MAX_SEED_HITS_PER_KMER) -- if any differ, the cache is silently  */
+/* ignored and rebuilt, never trusted stale. The cache file format is a   */
+/* private, this-binary-only format (no version negotiation across        */
+/* compilers/platforms) since it's a same-machine performance cache, not  */
+/* a portable index format like BWA's .bwt/.sa files -- documented here   */
+/* rather than treated as a hidden assumption. */
+/* ---------------------------------------------------------------------- */
+
+typedef struct {
+    char magic[8];      /* "RSPKIDX1" */
+    long ref_size;
+    long ref_mtime;
+    int  kmer_len;
+    int  splice_kmer_len;
+    int  table_bits;
+    int  splice_table_bits;
+    int  max_hits_per_kmer;
+    int  n_chroms;
+} IndexCacheHeader;
+
+static void cache_path_for(const char *ref_path, char *out, size_t outsz) {
+    snprintf(out, outsz, "%s.kidx", ref_path);
+}
+
+static int stat_file(const char *path, long *size, long *mtime) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    *size = (long)st.st_size;
+    *mtime = (long)st.st_mtime;
+    return 1;
+}
+
+static void write_chrom(FILE *f, const Chrom *c) {
+    int namelen = (int)strlen(c->name);
+    fwrite(&namelen, sizeof(int), 1, f);
+    fwrite(c->name, 1, (size_t)namelen, f);
+    fwrite(&c->len, sizeof(long), 1, f);
+    fwrite(c->seq, 1, (size_t)c->len, f);
+}
+
+static int read_chrom(FILE *f, Chrom *c) {
+    int namelen;
+    if (fread(&namelen, sizeof(int), 1, f) != 1) return 0;
+    if (namelen < 0 || namelen >= MAX_SEQNAME) return 0;
+    memset(c->name, 0, MAX_SEQNAME);
+    if (namelen > 0 && fread(c->name, 1, (size_t)namelen, f) != (size_t)namelen) return 0;
+    if (fread(&c->len, sizeof(long), 1, f) != 1) return 0;
+    if (c->len < 0) return 0;
+    c->seq = xmalloc((size_t)c->len + 1);
+    if (c->len > 0 && fread(c->seq, 1, (size_t)c->len, f) != (size_t)c->len) return 0;
+    c->seq[c->len] = '\0';
+    return 1;
+}
+
+static long count_table_entries(KmerEntry **table, uint32_t table_size) {
+    long n = 0;
+    for (uint32_t h = 0; h < table_size; h++)
+        for (KmerEntry *e = table[h]; e; e = e->next) n++;
+    return n;
+}
+
+typedef struct { uint32_t kmer; int32_t n_hits; } KmerMetaRec;
+
+static void write_table(FILE *f, KmerEntry **table, uint32_t table_size) {
+    long n = count_table_entries(table, table_size);
+    long total_hits = 0;
+    for (uint32_t h = 0; h < table_size; h++)
+        for (KmerEntry *e = table[h]; e; e = e->next) total_hits += e->n_hits;
+
+    fwrite(&n, sizeof(long), 1, f);
+    fwrite(&total_hits, sizeof(long), 1, f);
+
+    /* Bulk-serialize into two flat buffers, then write each with a single
+     * fwrite() call, instead of 2-3 tiny fwrite() calls per entry. With up
+     * to ~12M entries the per-call overhead dominates over the actual
+     * bytes moved -- confirmed directly: the original per-entry version
+     * made loading FROM the cache slower than just rebuilding the index
+     * from scratch. */
+    KmerMetaRec *meta = xmalloc(sizeof(KmerMetaRec) * (size_t)(n > 0 ? n : 1));
+    SeedHit *hitsbuf = xmalloc(sizeof(SeedHit) * (size_t)(total_hits > 0 ? total_hits : 1));
+    long mi = 0, hi = 0;
+    for (uint32_t h = 0; h < table_size; h++) {
+        for (KmerEntry *e = table[h]; e; e = e->next) {
+            meta[mi].kmer = e->kmer; meta[mi].n_hits = e->n_hits; mi++;
+            if (e->n_hits > 0) {
+                memcpy(&hitsbuf[hi], e->hits, sizeof(SeedHit) * (size_t)e->n_hits);
+                hi += e->n_hits;
+            }
+        }
+    }
+    if (n > 0) fwrite(meta, sizeof(KmerMetaRec), (size_t)n, f);
+    if (total_hits > 0) fwrite(hitsbuf, sizeof(SeedHit), (size_t)total_hits, f);
+    free(meta); free(hitsbuf);
+}
+
+static int read_table(FILE *f, KmerEntry **table, uint32_t mask) {
+    long n, total_hits;
+    if (fread(&n, sizeof(long), 1, f) != 1) return 0;
+    if (fread(&total_hits, sizeof(long), 1, f) != 1) return 0;
+    if (n < 0 || total_hits < 0) return 0;
+
+    KmerMetaRec *meta = xmalloc(sizeof(KmerMetaRec) * (size_t)(n > 0 ? n : 1));
+    if (n > 0 && fread(meta, sizeof(KmerMetaRec), (size_t)n, f) != (size_t)n) { free(meta); return 0; }
+
+    /* This buffer is intentionally never freed here -- every loaded
+     * KmerEntry's hits[] pointer is a direct slice into it (no per-entry
+     * copy), so it has to live for the rest of the process, same as
+     * everything else the index touches. */
+    SeedHit *hitsbuf = xmalloc(sizeof(SeedHit) * (size_t)(total_hits > 0 ? total_hits : 1));
+    if (total_hits > 0 && fread(hitsbuf, sizeof(SeedHit), (size_t)total_hits, f) != (size_t)total_hits) {
+        free(meta); free(hitsbuf); return 0;
+    }
+
+    long ho = 0;
+    for (long i = 0; i < n; i++) {
+        uint32_t kmer = meta[i].kmer; int n_hits = meta[i].n_hits;
+        if (n_hits < 0 || n_hits > MAX_SEED_HITS_PER_KMER) { free(meta); return 0; }
+        KmerEntry *e = entry_arena_alloc();
+        e->kmer = kmer;
+        e->n_hits = n_hits;
+        e->hits_cap = n_hits;
+        e->hits = &hitsbuf[ho];
+        ho += n_hits;
+        uint32_t h = hash_kmer(kmer, mask);
+        e->next = table[h];
+        table[h] = e;
+    }
+    free(meta);
+    return 1;
+}
+
+/* Returns 1 and populates chroms[]/n_chroms/both k-mer tables on a cache
+ * hit; returns 0 (leaving global state untouched) on any miss or read
+ * failure, so the caller can always fall back to the normal FASTA-parse +
+ * index-build path. */
+static int try_load_index_cache(const char *ref_path) {
+    long size, mtime;
+    if (!stat_file(ref_path, &size, &mtime)) return 0;
+    char cpath[2048];
+    cache_path_for(ref_path, cpath, sizeof(cpath));
+    FILE *f = fopen(cpath, "rb");
+    if (!f) return 0;
+    static char rdbuf[1 << 20];
+    setvbuf(f, rdbuf, _IOFBF, sizeof(rdbuf));
+
+    IndexCacheHeader hdr;
+    int ok = (fread(&hdr, sizeof(hdr), 1, f) == 1) &&
+             memcmp(hdr.magic, "RSPKIDX1", 8) == 0 &&
+             hdr.ref_size == size && hdr.ref_mtime == mtime &&
+             hdr.kmer_len == KMER_LEN && hdr.splice_kmer_len == SPLICE_KMER_LEN &&
+             hdr.table_bits == KMER_TABLE_BITS && hdr.splice_table_bits == SPLICE_TABLE_BITS &&
+             hdr.max_hits_per_kmer == MAX_SEED_HITS_PER_KMER &&
+             hdr.n_chroms > 0 && hdr.n_chroms <= MAX_CHROMS;
+    if (ok) {
+        n_chroms = hdr.n_chroms;
+        for (int i = 0; i < n_chroms && ok; i++) ok = read_chrom(f, &chroms[i]);
+        if (ok) ok = read_table(f, kmer_table, KMER_TABLE_MASK);
+        if (ok) ok = read_table(f, kmer_table_splice, SPLICE_TABLE_MASK);
+    }
+    fclose(f);
+    if (!ok) { n_chroms = 0; } /* don't leave a half-populated state on a corrupt/truncated cache file */
+    return ok;
+}
+
+static void save_index_cache(const char *ref_path) {
+    long size, mtime;
+    if (!stat_file(ref_path, &size, &mtime)) return; /* can't fingerprint -> skip caching, not fatal */
+    char cpath[2048], tmp_path[2080];
+    cache_path_for(ref_path, cpath, sizeof(cpath));
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp%d", cpath, (int)getpid());
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) return; /* e.g. read-only reference directory -- silently skip, not fatal */
+    static char wrbuf[1 << 20];
+    setvbuf(f, wrbuf, _IOFBF, sizeof(wrbuf));
+
+    IndexCacheHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, "RSPKIDX1", 8);
+    hdr.ref_size = size; hdr.ref_mtime = mtime;
+    hdr.kmer_len = KMER_LEN; hdr.splice_kmer_len = SPLICE_KMER_LEN;
+    hdr.table_bits = KMER_TABLE_BITS; hdr.splice_table_bits = SPLICE_TABLE_BITS;
+    hdr.max_hits_per_kmer = MAX_SEED_HITS_PER_KMER;
+    hdr.n_chroms = n_chroms;
+    fwrite(&hdr, sizeof(hdr), 1, f);
+    for (int i = 0; i < n_chroms; i++) write_chrom(f, &chroms[i]);
+    write_table(f, kmer_table, KMER_TABLE_SIZE);
+    write_table(f, kmer_table_splice, SPLICE_TABLE_SIZE);
+    int write_ok = !ferror(f);
+    fclose(f);
+
+    /* Write to a temp file and rename() into place (atomic on the same
+     * filesystem) so a reader never sees a partially-written cache file,
+     * and a run killed mid-write can't corrupt a previously good cache. */
+    if (write_ok) rename(tmp_path, cpath);
+    else unlink(tmp_path);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -972,7 +1197,7 @@ static int try_sw_align_multi(const char *query, int qlen, char strand,
         int so = seed_offsets[s];
         uint32_t kmer;
         if (!encode_kmer(query + so, KMER_LEN, &kmer)) continue;
-        KmerEntry *e = kmer_index_lookup(kmer_table, kmer);
+        KmerEntry *e = kmer_index_lookup(kmer_table, KMER_TABLE_MASK, kmer);
         if (!e) continue;
         for (int h = 0; h < e->n_hits; h++) {
             long implied_start = e->hits[h].pos - so;
@@ -1077,8 +1302,8 @@ static int try_spliced_align(const char *query, int qlen, char strand, Hit *out)
     if (!encode_kmer(query, SPLICE_KMER_LEN, &kmer_l)) return 0;
     if (!encode_kmer(query + qlen - SPLICE_KMER_LEN, SPLICE_KMER_LEN, &kmer_r)) return 0;
 
-    KmerEntry *el = kmer_index_lookup(kmer_table_splice, kmer_l);
-    KmerEntry *er = kmer_index_lookup(kmer_table_splice, kmer_r);
+    KmerEntry *el = kmer_index_lookup(kmer_table_splice, SPLICE_TABLE_MASK, kmer_l);
+    KmerEntry *er = kmer_index_lookup(kmer_table_splice, SPLICE_TABLE_MASK, kmer_r);
     if (!el || !er) return 0;
 
     int found = 0, best_mm = SPLICE_MAX_MISMATCHES + 1, best_canon = 0;
@@ -1605,12 +1830,18 @@ int main(int argc, char **argv) {
         snprintf(reads_desc, sizeof(reads_desc), "%s + %s", argv[4], argv[5]);
     } else { usage(argv[0]); return 1; }
 
-    printf("[1/7] Loading reference FASTA: %s\n", ref_path);
-    load_reference(ref_path);
-    printf("      -> %d sequence(s) loaded\n", n_chroms);
-
-    printf("[2/7] Building k-mer index (k=%d)\n", KMER_LEN);
-    build_kmer_index();
+    printf("[1/7] Loading reference + k-mer index (k=%d): %s\n", KMER_LEN, ref_path);
+    if (try_load_index_cache(ref_path)) {
+        printf("      -> loaded from cache (%s.kidx): %d sequence(s), skipped FASTA parse + index build\n", ref_path, n_chroms);
+        printf("[2/7] (skipped -- index came from cache)\n");
+    } else {
+        load_reference(ref_path);
+        printf("      -> %d sequence(s) loaded from FASTA\n", n_chroms);
+        printf("[2/7] Building k-mer index (k=%d)\n", KMER_LEN);
+        build_kmer_index();
+        save_index_cache(ref_path);
+        printf("      -> index cached for future runs: %s.kidx\n", ref_path);
+    }
 
     printf("[3/7] Loading GTF annotation: %s\n", gtf_path);
     load_gtf(gtf_path);

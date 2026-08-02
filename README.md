@@ -29,6 +29,13 @@ Reads can be plain `.fastq` — the pipeline doesn't read `.gz` directly, so `gu
 gunzip -k reads_1.fastq.gz reads_2.fastq.gz
 ```
 
+For the data set in the attached directory:
+./rnaseq_pipeline genome.fa yeast.gtf pe reads_1.fastq reads_2.fastq outdir/
+
+Below is the command used to time the jobrun using the yeast.gtf created in step 3 below.
+```
+time ./rnaseq_pipeline Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa yeast.gtf pe 1M_SRR9336468_1.fastq 1M_SRR9336468_2.fastq ./outdir/
+```
 ## 3. Annotation format — one thing to watch for
 
 The pipeline expects **GTF**, not GFF3. The annotation file whose link is given in the data folder is in GFF3 format, so it has to be converted before testing. If you're working from the same Ensembl-style GFF3, you'll need to do the same — a minimal gene-level conversion:

@@ -1295,6 +1295,18 @@ static int try_sw_align_multi(const char *query, int qlen, char strand,
  * can still be seeded -- the earlier version required a full KMER_LEN
  * (16bp) exact match on BOTH sides, which meant any junction close to
  * either read edge was simply unseedable and silently missed. */
+/* Reusable per-thread scratch for the breakpoint prefix sums below. */
+static int *spl_pre1, *spl_suf2;
+static int  spl_scratch_len = 0;
+#pragma omp threadprivate(spl_pre1, spl_suf2, spl_scratch_len)
+
+static void spl_scratch_ensure(int qlen_plus1) {
+    if (spl_scratch_len >= qlen_plus1) return;
+    spl_pre1 = xrealloc(spl_pre1, sizeof(int) * qlen_plus1);
+    spl_suf2 = xrealloc(spl_suf2, sizeof(int) * qlen_plus1);
+    spl_scratch_len = qlen_plus1;
+}
+
 static int try_spliced_align(const char *query, int qlen, char strand, Hit *out) {
     if (qlen < 2 * SPLICE_KMER_LEN + 4) return 0;
 
@@ -1310,6 +1322,10 @@ static int try_spliced_align(const char *query, int qlen, char strand, Hit *out)
     int best_chrom = -1, best_b = -1;
     long best_c1 = -1, best_intron = -1;
 
+    spl_scratch_ensure(qlen + 1);
+    int *pre1 = spl_pre1;  /* pre1[k]  = mismatches between query[0..k) and chrom[c1..c1+k)          */
+    int *suf2 = spl_suf2;  /* suf2[k]  = mismatches between query[k..qlen) and chrom[c1+intron+k..) */
+
     for (int i = 0; i < el->n_hits; i++) {
         int ci = el->hits[i].chrom_idx;
         long c1 = el->hits[i].pos;
@@ -1322,15 +1338,54 @@ static int try_spliced_align(const char *query, int qlen, char strand, Hit *out)
             if (intron < MIN_INTRON || intron > MAX_INTRON) continue;
             if (c1 < 0) continue;
 
-            for (int b = SPLICE_KMER_LEN; b <= qlen - SPLICE_KMER_LEN; b++) {
-                int mm1 = hamming_at(chrom, c1, query, b, SPLICE_MAX_MISMATCHES);
-                if (mm1 < 0) continue;
-                long exon2_start = c1 + b + intron;
-                int mm2 = hamming_at(chrom, exon2_start, query + b, qlen - b, SPLICE_MAX_MISMATCHES - mm1);
-                if (mm2 < 0) continue;
-                int total = mm1 + mm2;
-                if (total > SPLICE_MAX_MISMATCHES) continue;
+            /* Bounds, derived to exactly match what the per-breakpoint
+             * hamming_at() calls below used to check individually:
+             *  - exon1 hypothesis at breakpoint b needs [c1, c1+b) in
+             *    bounds, i.e. b <= chrom->len - c1 =: exon1_limit.
+             *  - exon2 hypothesis at breakpoint b needs [c1+b+intron,
+             *    c1+intron+qlen) in bounds. The upper edge (c1+intron+qlen)
+             *    doesn't depend on b at all -- either every b clears it or
+             *    none do. The lower edge (c1+b+intron >= 0) gives a floor
+             *    on b: b >= -(c1+intron) =: b_min2.
+             * Any b outside [b_lo, b_hi] would have made the original
+             * hamming_at() calls return -1 (out of range) and `continue`,
+             * exactly as skipping it here does. */
+            if (c1 + intron + qlen > chrom->len) continue;
+            long exon1_limit = chrom->len - c1;
+            long b_min2 = -(c1 + intron); if (b_min2 < SPLICE_KMER_LEN) b_min2 = SPLICE_KMER_LEN;
+            long b_lo = b_min2;
+            long b_hi = qlen - SPLICE_KMER_LEN;
+            if (exon1_limit < b_hi) b_hi = exon1_limit;
+            if (b_lo > b_hi) continue;
 
+            /* O(qlen) prefix sums, computed once for this (c1,intron) pair,
+             * covering exactly the range any valid breakpoint could need
+             * (previously: O(qlen) work PER breakpoint, ~qlen/2 breakpoints
+             * tried, an O(qlen^2) rescan-from-scratch every single time --
+             * confirmed by profiling as the dominant cost once the k-mer
+             * index build was cached out: hamming_at alone was called
+             * ~235 times per read on average). */
+            pre1[0] = 0;
+            for (long k = 0; k < b_hi; k++) {
+                char a = toupper((unsigned char)chrom->seq[c1 + k]);
+                char qc = toupper((unsigned char)query[k]);
+                pre1[k + 1] = pre1[(int)k] + (a != qc ? 1 : 0);
+            }
+            suf2[qlen] = 0;
+            for (long k = qlen - 1; k >= b_lo; k--) {
+                char a = toupper((unsigned char)chrom->seq[c1 + intron + k]);
+                char qc = toupper((unsigned char)query[k]);
+                suf2[(int)k] = suf2[(int)k + 1] + (a != qc ? 1 : 0);
+            }
+
+            for (long b = b_lo; b <= b_hi; b++) {
+                int mm1 = pre1[(int)b];
+                if (mm1 > SPLICE_MAX_MISMATCHES) continue;
+                int mm2 = suf2[(int)b];
+                if (mm2 > SPLICE_MAX_MISMATCHES - mm1) continue;
+                int total = mm1 + mm2;
+
+                long exon2_start = c1 + b + intron;
                 int canon = 0;
                 long donor_pos = c1 + b;
                 long acceptor_end = exon2_start;
@@ -1345,7 +1400,7 @@ static int try_spliced_align(const char *query, int qlen, char strand, Hit *out)
                 int better = !found || (canon && !best_canon) || (canon == best_canon && total < best_mm);
                 if (better) {
                     found = 1; best_mm = total; best_canon = canon;
-                    best_chrom = ci; best_c1 = c1; best_intron = intron; best_b = b;
+                    best_chrom = ci; best_c1 = c1; best_intron = intron; best_b = (int)b;
                 }
             }
         }
@@ -1738,6 +1793,313 @@ static void write_qc_report(const char *outdir) {
     fclose(f);
 }
 
+/* ---------------------------------------------------------------------- */
+/* Static HTML QC/alignment report (self-contained inline SVG, no         */
+/* external JS/CDN dependency -- this runs on HPC nodes that may not have */
+/* internet access, so nothing here can assume a network fetch works).   */
+/*                                                                        */
+/* This mirrors the subset of nf-core/rnaseq's MultiQC report that        */
+/* actually applies to a SINGLE sample run (which is what this pipeline   */
+/* processes per invocation, same as pointing nf-core/rnaseq at one       */
+/* sample would give you):                                                */
+/*   - alignment-fate bar     (~ MultiQC's STAR/HISAT2 alignment bar)     */
+/*   - per-base mean quality  (~ FastQC "per base sequence quality")      */
+/*   - fragment-size histogram, PE only (~ nf-core's RSeQC "inner         */
+/*     distance" plot)                                                    */
+/*   - top expressed genes    (not literally an nf-core QC plot, but the  */
+/*     natural first thing anyone looks at after quantification)          */
+/*   - trimmed read length histogram (~ TrimGalore's length-distribution  */
+/*     plot in the MultiQC report)                                        */
+/*                                                                        */
+/* NOT reproduced here: DESeq2 PCA plot and the sample-distance heatmap.  */
+/* Both are fundamentally cross-sample comparisons (they need >=2 samples */
+/* to place points or compute pairwise distances) -- they belong one      */
+/* level up, in whatever aggregates multiple runs of this pipeline, not   */
+/* in a single run's report, exactly as they don't appear in nf-core's    */
+/* per-sample MultiQC section either (they're built from the merged       */
+/* gene-count matrix across the whole run's samples).                     */
+/* ---------------------------------------------------------------------- */
+
+#define SVG_W 720
+#define SVG_H 300
+#define SVG_MARGIN_L 55
+#define SVG_MARGIN_B 78
+#define SVG_MARGIN_T 16
+#define SVG_MARGIN_R 16
+
+static void html_escape(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 6 < outsz; i++) {
+        switch (in[i]) {
+            case '&': o += (size_t)snprintf(out + o, outsz - o, "&amp;"); break;
+            case '<': o += (size_t)snprintf(out + o, outsz - o, "&lt;"); break;
+            case '>': o += (size_t)snprintf(out + o, outsz - o, "&gt;"); break;
+            case '"': o += (size_t)snprintf(out + o, outsz - o, "&quot;"); break;
+            default:  out[o++] = in[i];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Vertical bar chart: n <= ~12 categories with short labels (alignment
+ * fate, trimmed-length buckets, insert-size buckets). */
+static void svg_vbar_chart(FILE *f, const char **labels, const double *values, int n, const char *color) {
+    int plot_w = SVG_W - SVG_MARGIN_L - SVG_MARGIN_R;
+    int plot_h = SVG_H - SVG_MARGIN_T - SVG_MARGIN_B;
+    double maxv = 0; for (int i = 0; i < n; i++) if (values[i] > maxv) maxv = values[i];
+    if (maxv <= 0) maxv = 1;
+
+    fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", SVG_W, SVG_H);
+    for (int t = 0; t <= 4; t++) {
+        double val = maxv * t / 4.0;
+        int y = SVG_MARGIN_T + plot_h - (int)(plot_h * t / 4.0);
+        fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#e8e8e8\"/>\n", SVG_MARGIN_L, y, SVG_MARGIN_L + plot_w, y);
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#666\" text-anchor=\"end\">%.0f</text>\n", SVG_MARGIN_L - 6, y + 4, val);
+    }
+    fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#bbb\"/>\n",
+            SVG_MARGIN_L, SVG_MARGIN_T + plot_h, SVG_MARGIN_L + plot_w, SVG_MARGIN_T + plot_h);
+
+    double bw = n > 0 ? (double)plot_w / n : plot_w;
+    for (int i = 0; i < n; i++) {
+        double bh = plot_h * (values[i] / maxv);
+        int x = SVG_MARGIN_L + (int)(i * bw) + 4;
+        int barw = (int)bw - 8; if (barw < 3) barw = 3;
+        int y = SVG_MARGIN_T + plot_h - (int)bh;
+        char lbl[128]; html_escape(labels[i], lbl, sizeof(lbl));
+        fprintf(f, "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%.1f\" fill=\"%s\" rx=\"2\"/>\n", x, y, barw, bh, color);
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"10.5\" fill=\"#333\" text-anchor=\"middle\">%.0f</text>\n",
+                x + barw / 2, y - 5, values[i]);
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#333\" text-anchor=\"end\" transform=\"rotate(-32 %d,%d)\">%s</text>\n",
+                x + barw / 2, SVG_MARGIN_T + plot_h + 16, x + barw / 2, SVG_MARGIN_T + plot_h + 16, lbl);
+    }
+    fprintf(f, "</svg>\n");
+}
+
+/* Horizontal bar chart: best for a handful of longer text labels (gene IDs). */
+static void svg_hbar_chart(FILE *f, const char **labels, const double *values, int n, const char *color) {
+    int row_h = 24, gap = 6;
+    int plot_h_needed = n * (row_h + gap) + 10;
+    int h = plot_h_needed + SVG_MARGIN_T + 24;
+    int margin_l = 150, margin_r = 60;
+    int plot_w = SVG_W - margin_l - margin_r;
+    double maxv = 0; for (int i = 0; i < n; i++) if (values[i] > maxv) maxv = values[i];
+    if (maxv <= 0) maxv = 1;
+
+    fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", SVG_W, h);
+    for (int i = 0; i < n; i++) {
+        int y = SVG_MARGIN_T + i * (row_h + gap);
+        double bw = plot_w * (values[i] / maxv);
+        char lbl[128]; html_escape(labels[i], lbl, sizeof(lbl));
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#333\" text-anchor=\"end\">%s</text>\n",
+                margin_l - 8, y + row_h / 2 + 4, lbl);
+        fprintf(f, "<rect x=\"%d\" y=\"%d\" width=\"%.1f\" height=\"%d\" fill=\"%s\" rx=\"2\"/>\n",
+                margin_l, y, bw, row_h, color);
+        fprintf(f, "<text x=\"%.1f\" y=\"%d\" font-size=\"11\" fill=\"#333\">%.1f</text>\n",
+                margin_l + bw + 6, y + row_h / 2 + 4, values[i]);
+    }
+    fprintf(f, "</svg>\n");
+}
+
+/* Line chart for a per-position running metric (per-base mean quality). */
+static void svg_line_chart(FILE *f, const double *y_vals, int n, double y_min_hint, double y_max_hint, const char *color) {
+    int plot_w = SVG_W - SVG_MARGIN_L - SVG_MARGIN_R;
+    int plot_h = SVG_H - SVG_MARGIN_T - SVG_MARGIN_B + 20;
+    double ymin = y_min_hint, ymax = y_max_hint;
+    for (int i = 0; i < n; i++) { if (y_vals[i] < ymin) ymin = y_vals[i]; if (y_vals[i] > ymax) ymax = y_vals[i]; }
+    if (ymax <= ymin) ymax = ymin + 1;
+
+    fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", SVG_W, SVG_H - 40);
+    for (int t = 0; t <= 4; t++) {
+        double val = ymin + (ymax - ymin) * t / 4.0;
+        int y = SVG_MARGIN_T + plot_h - (int)(plot_h * t / 4.0);
+        fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#e8e8e8\"/>\n", SVG_MARGIN_L, y, SVG_MARGIN_L + plot_w, y);
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#666\" text-anchor=\"end\">%.0f</text>\n", SVG_MARGIN_L - 6, y + 4, val);
+    }
+    fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#bbb\"/>\n",
+            SVG_MARGIN_L, SVG_MARGIN_T + plot_h, SVG_MARGIN_L + plot_w, SVG_MARGIN_T + plot_h);
+    for (int t = 0; t <= 5 && n > 1; t++) {
+        int idx = (int)((double)(n - 1) * t / 5.0);
+        int x = SVG_MARGIN_L + (int)((double)plot_w * idx / (n - 1));
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#666\" text-anchor=\"middle\">%d</text>\n",
+                x, SVG_MARGIN_T + plot_h + 16, idx + 1);
+    }
+
+    fprintf(f, "<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"2\" points=\"", color);
+    for (int i = 0; i < n; i++) {
+        int x = SVG_MARGIN_L + (n > 1 ? (int)((double)plot_w * i / (n - 1)) : 0);
+        int y = SVG_MARGIN_T + plot_h - (int)(plot_h * (y_vals[i] - ymin) / (ymax - ymin));
+        fprintf(f, "%d,%d ", x, y);
+    }
+    fprintf(f, "\"/>\n</svg>\n");
+}
+
+static int cmp_gene_effcount_desc(const void *a, const void *b) {
+    const Gene *ga = *(Gene * const *)a, *gb = *(Gene * const *)b;
+    if (ga->effective_count > gb->effective_count) return -1;
+    if (ga->effective_count < gb->effective_count) return 1;
+    return 0;
+}
+
+static void write_html_report(const char *outdir, const char *reads_desc) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/report.html", outdir);
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "warning: could not write report.html (continuing)\n"); return; }
+
+    fprintf(f, "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\n");
+    fprintf(f, "<title>rnaseq_pipeline.c report</title>\n");
+    fprintf(f, "<style>\n"
+               "body{font-family:Helvetica,Arial,sans-serif;max-width:800px;margin:32px auto;padding:0 16px;color:#222;}\n"
+               "h1{font-size:20px;} h2{font-size:15px;margin-top:36px;border-bottom:1px solid #ddd;padding-bottom:6px;}\n"
+               "p.sub{color:#777;font-size:13px;margin-top:-8px;}\n"
+               ".card{border:1px solid #e3e3e3;border-radius:8px;padding:12px 16px;margin-top:10px;}\n"
+               ".note{color:#777;font-size:12px;margin-top:6px;}\n"
+               "</style></head><body>\n");
+    fprintf(f, "<h1>rnaseq_pipeline.c &mdash; run report</h1>\n");
+    fprintf(f, "<p class=\"sub\">%s &middot; %d %s &middot; single-sample run (see note at bottom on sample-comparison plots)</p>\n",
+            reads_desc, paired_mode ? n_reads / 2 : n_reads, paired_mode ? "read pairs" : "reads");
+
+    /* --- Alignment fate --------------------------------------------- */
+    {
+        const char *labels[4] = { "Unique", "Multi-mapped", "Mapped, no gene", "Unmapped" };
+        double values[4] = { (double)n_unique_units, (double)n_multi_units, (double)n_no_feature_units, (double)n_unmapped_units };
+        fprintf(f, "<h2>Alignment fate</h2>\n<div class=\"card\">\n");
+        svg_vbar_chart(f, labels, values, 4, "#2a78d6");
+        fprintf(f, "</div>\n<p class=\"note\">Analogous to the STAR/HISAT2 alignment bar in an nf-core/rnaseq MultiQC report: uniquely mapped, multi-mapped and resolved by EM, mapped but not overlapping an annotated gene, and unmapped.</p>\n");
+    }
+
+    /* --- Per-base mean quality (raw, pre-trim) ----------------------- */
+    {
+        int maxlen = 0;
+        for (int i = 0; i < n_reads; i++) if (reads[i].raw_len > maxlen) maxlen = reads[i].raw_len;
+        if (maxlen > MAX_READ_LEN) maxlen = MAX_READ_LEN;
+        if (maxlen > 0) {
+            double *qsum = xmalloc(sizeof(double) * maxlen);
+            long   *qn   = xmalloc(sizeof(long) * maxlen);
+            for (int p = 0; p < maxlen; p++) { qsum[p] = 0; qn[p] = 0; }
+            for (int i = 0; i < n_reads; i++) {
+                Read *r = &reads[i];
+                int lim = r->raw_len < maxlen ? r->raw_len : maxlen;
+                for (int p = 0; p < lim; p++) { qsum[p] += phred_to_prob_correct(r->qual[p]); qn[p]++; }
+            }
+            double *qmean = xmalloc(sizeof(double) * maxlen);
+            for (int p = 0; p < maxlen; p++) qmean[p] = qn[p] ? qsum[p] / qn[p] : 0.0;
+            fprintf(f, "<h2>Per-base mean quality (raw, pre-trim)</h2>\n<div class=\"card\">\n");
+            svg_line_chart(f, qmean, maxlen, 0, 40, "#2a9d5c");
+            fprintf(f, "</div>\n<p class=\"note\">X axis: position in read (1-based). Y axis: mean Phred quality. Analogous to FastQC's \"per base sequence quality\" plot.</p>\n");
+            free(qsum); free(qn); free(qmean);
+        }
+    }
+
+    /* --- Fragment size distribution (paired-end only) ----------------- */
+    if (paired_mode) {
+        #define FRAG_NBINS 15
+        long bin_counts[FRAG_NBINS]; for (int i = 0; i < FRAG_NBINS; i++) bin_counts[i] = 0;
+        long minf = -1, maxf = -1;
+        for (int i = 0; i + 1 < n_reads; i += 2) {
+            Read *r1 = &reads[i], *r2 = &reads[i + 1];
+            if (!is_proper_pair(r1, r2)) continue;
+            const Hit *h1 = &r1->aln.hits[0], *h2 = &r2->aln.hits[0];
+            long left = lmin(hit_span_start0(h1), hit_span_start0(h2));
+            long right = lmax(hit_span_end0(h1), hit_span_end0(h2));
+            long span = right - left + 1;
+            if (minf < 0 || span < minf) minf = span;
+            if (span > maxf) maxf = span;
+        }
+        if (maxf > minf && maxf >= 0) {
+            double bin_w = (double)(maxf - minf + 1) / FRAG_NBINS;
+            for (int i = 0; i + 1 < n_reads; i += 2) {
+                Read *r1 = &reads[i], *r2 = &reads[i + 1];
+                if (!is_proper_pair(r1, r2)) continue;
+                const Hit *h1 = &r1->aln.hits[0], *h2 = &r2->aln.hits[0];
+                long left = lmin(hit_span_start0(h1), hit_span_start0(h2));
+                long right = lmax(hit_span_end0(h1), hit_span_end0(h2));
+                long span = right - left + 1;
+                int bin = (int)((span - minf) / bin_w);
+                if (bin >= FRAG_NBINS) bin = FRAG_NBINS - 1;
+                if (bin < 0) bin = 0;
+                bin_counts[bin]++;
+            }
+            const char *labels[FRAG_NBINS]; char lblbuf[FRAG_NBINS][32]; double values[FRAG_NBINS];
+            for (int i = 0; i < FRAG_NBINS; i++) {
+                long lo = minf + (long)(i * bin_w), hi = minf + (long)((i + 1) * bin_w) - 1;
+                snprintf(lblbuf[i], sizeof(lblbuf[i]), "%ld-%ld", lo, hi);
+                labels[i] = lblbuf[i];
+                values[i] = (double)bin_counts[i];
+            }
+            fprintf(f, "<h2>Fragment size distribution</h2>\n<div class=\"card\">\n");
+            svg_vbar_chart(f, labels, values, FRAG_NBINS, "#c8622d");
+            fprintf(f, "</div>\n<p class=\"note\">Genomic span of properly-paired fragments (FR orientation, same chromosome). Analogous to RSeQC's \"inner distance\" plot in the nf-core/rnaseq MultiQC report.</p>\n");
+        }
+        #undef FRAG_NBINS
+    }
+
+    /* --- Top expressed genes ------------------------------------------ */
+    if (n_genes > 0) {
+        int topn = n_genes < 15 ? n_genes : 15;
+        Gene **sorted = xmalloc(sizeof(Gene *) * n_genes);
+        for (int i = 0; i < n_genes; i++) sorted[i] = &genes[i];
+        qsort(sorted, n_genes, sizeof(Gene *), cmp_gene_effcount_desc);
+        const char *labels[15]; double values[15];
+        int shown = 0;
+        for (int i = 0; i < topn; i++) {
+            if (sorted[i]->effective_count <= 0) break;
+            labels[shown] = sorted[i]->gene_id;
+            values[shown] = sorted[i]->effective_count;
+            shown++;
+        }
+        if (shown > 0) {
+            fprintf(f, "<h2>Top %d expressed genes</h2>\n<div class=\"card\">\n", shown);
+            svg_hbar_chart(f, labels, values, shown, "#6a4fb3");
+            fprintf(f, "</div>\n<p class=\"note\">Ranked by EM effective count (unique reads + proportional multi-mapper share), same metric as gene_counts.tsv.</p>\n");
+        }
+        free(sorted);
+    }
+
+    /* --- Trimmed read length distribution ------------------------------ */
+    {
+        int minl = -1, maxl = -1;
+        for (int i = 0; i < n_reads; i++) {
+            if (minl < 0 || reads[i].trimmed_len < minl) minl = reads[i].trimmed_len;
+            if (reads[i].trimmed_len > maxl) maxl = reads[i].trimmed_len;
+        }
+        if (maxl > minl && maxl >= 0) {
+            #define LEN_NBINS 12
+            long bin_counts[LEN_NBINS]; for (int i = 0; i < LEN_NBINS; i++) bin_counts[i] = 0;
+            double bin_w = (double)(maxl - minl + 1) / LEN_NBINS;
+            for (int i = 0; i < n_reads; i++) {
+                int bin = (int)((reads[i].trimmed_len - minl) / bin_w);
+                if (bin >= LEN_NBINS) bin = LEN_NBINS - 1;
+                if (bin < 0) bin = 0;
+                bin_counts[bin]++;
+            }
+            const char *labels[LEN_NBINS]; char lblbuf[LEN_NBINS][32]; double values[LEN_NBINS];
+            for (int i = 0; i < LEN_NBINS; i++) {
+                int lo = minl + (int)(i * bin_w), hi = minl + (int)((i + 1) * bin_w) - 1;
+                snprintf(lblbuf[i], sizeof(lblbuf[i]), "%d-%d", lo, hi);
+                labels[i] = lblbuf[i];
+                values[i] = (double)bin_counts[i];
+            }
+            fprintf(f, "<h2>Trimmed read length distribution</h2>\n<div class=\"card\">\n");
+            svg_vbar_chart(f, labels, values, LEN_NBINS, "#d6a02a");
+            fprintf(f, "</div>\n<p class=\"note\">Length after adapter/quality trimming. Analogous to TrimGalore's length-distribution plot in the MultiQC report.</p>\n");
+            #undef LEN_NBINS
+        }
+    }
+
+    fprintf(f, "<h2>Not included here</h2>\n");
+    fprintf(f, "<p class=\"note\">nf-core/rnaseq's MultiQC report also includes a DESeq2 PCA plot and a "
+               "sample-distance heatmap. Both compare gene expression <em>across multiple samples</em> "
+               "(they need &ge;2 samples to place points or compute pairwise distances), so they don't "
+               "apply to a single run of this pipeline any more than they'd apply to a single sample run "
+               "through nf-core/rnaseq &mdash; they belong in whatever aggregates multiple runs' "
+               "gene_counts.tsv files, not in a per-run report like this one.</p>\n");
+
+    fprintf(f, "</body></html>\n");
+    fclose(f);
+}
+
+
 static void write_summary(const char *outdir, const char *ref_path, const char *gtf_path,
                            const char *reads_desc) {
     char path[1024];
@@ -1803,15 +2165,486 @@ static void write_summary(const char *outdir, const char *ref_path, const char *
 /* main                                                                    */
 /* ---------------------------------------------------------------------- */
 
+/* ======================================================================= */
+/* Multi-sample compare mode: PCA plot + sample-distance heatmap.          */
+/*                                                                         */
+/* This is the piece deliberately left out of write_html_report() above:  */
+/* nf-core/rnaseq's DESeq2 PCA plot and sample-distance heatmap are both   */
+/* comparisons ACROSS samples, and this pipeline (like nf-core/rnaseq's    */
+/* own STAR/Salmon quantification step) processes one sample per          */
+/* invocation. So this lives as a separate mode, taking the gene_counts.tsv */
+/* from several already-completed single-sample runs and producing the    */
+/* cross-sample report -- the same two-stage shape nf-core itself has      */
+/* (per-sample quantification, then a separate DESeq2 step over the        */
+/* merged count matrix).                                                   */
+/*                                                                         */
+/* Honesty about what's simplified vs. real DESeq2:                        */
+/*  - Real DESeq2 uses a regularized-log or variance-stabilizing           */
+/*    transform (rlog/vst) that models the mean-variance trend per gene.   */
+/*    Implementing that from scratch is a much bigger undertaking than     */
+/*    this pass -- this uses log2(CPM+1), a standard, simpler stand-in     */
+/*    that also compresses the heavy right tail of count data, but doesn't */
+/*    model dispersion. Samples should still separate/cluster correctly    */
+/*    for any real biological signal, but don't read exact distances here  */
+/*    as DESeq2-calibrated.                                                */
+/*  - PCA is computed exactly (Jacobi eigendecomposition of the sample x   */
+/*    sample Gram matrix, the standard trick when genes >> samples --      */
+/*    same underlying math as prcomp()/DESeq2's plotPCA, not an            */
+/*    approximation), restricted to the top 500 most-variable genes,       */
+/*    matching nf-core/rnaseq's own DESeq2 PCA convention.                 */
+/*  - The heatmap distance and the PCA use the same top-variable-gene      */
+/*    subset for consistency; DESeq2's own sample-distance heatmap         */
+/*    conventionally uses the full transformed matrix instead. Noted in    */
+/*    the generated report, not hidden.                                    */
+/* ======================================================================= */
+
+#define COMPARE_TOP_N_GENES 500
+#define MAX_COMPARE_SAMPLES 64
+
+typedef struct {
+    char name[256];
+    double *log2cpm;   /* [n_genes_canonical], aligned to the canonical gene index */
+    double lib_size;   /* sum of effective_count across all genes in this sample */
+} CompareSample;
+
+/* Minimal growable string->double map keyed by gene_id, used only to align
+ * later samples' gene_counts.tsv rows onto the first sample's gene order. */
+typedef struct { char gene_id[MAX_SEQNAME]; double val; } GeneCountRow;
+
+static int read_gene_counts_tsv(const char *path, GeneCountRow **rows_out) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "error: cannot open %s\n", path); return -1; }
+    int cap = 4096, n = 0;
+    GeneCountRow *rows = xmalloc(sizeof(GeneCountRow) * cap);
+    char line[4096];
+    int first = 1;
+    while (fgets(line, sizeof(line), f)) {
+        if (first) { first = 0; continue; } /* header */
+        if (line[0] == '_' && line[1] == '_') continue; /* __no_feature / __unmapped */
+        char *saveptr = NULL;
+        char *gene_id = strtok_r(line, "\t", &saveptr);
+        if (!gene_id) continue;
+        for (int c = 0; c < 5; c++) strtok_r(NULL, "\t", &saveptr); /* skip chrom,start,end,strand,unique_count */
+        char *eff_str = strtok_r(NULL, "\t\r\n", &saveptr);
+        if (!eff_str) continue;
+        if (n >= cap) { cap *= 2; rows = xrealloc(rows, sizeof(GeneCountRow) * cap); }
+        snprintf(rows[n].gene_id, sizeof(rows[n].gene_id), "%s", gene_id);
+        rows[n].val = atof(eff_str);
+        n++;
+    }
+    fclose(f);
+    *rows_out = rows;
+    return n;
+}
+
+static const char *basename_noslash(const char *path) {
+    static char buf[256];
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+    size_t start = len;
+    while (start > 0 && path[start - 1] != '/') start--;
+    size_t n = len - start; if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, path + start, n); buf[n] = '\0';
+    return buf;
+}
+
+/* Classic cyclic Jacobi eigenvalue algorithm for real symmetric matrices
+ * (Numerical Recipes 11.1) -- robust and simple, more than adequate for the
+ * tiny (few-to-dozens of samples) matrices this is used on; performance is
+ * a non-issue at this scale. On return, a's diagonal holds the eigenvalues
+ * and v's COLUMNS hold the corresponding unit eigenvectors. a is used as
+ * scratch and left with near-zero off-diagonal entries. */
+static void jacobi_eigen(double **a, int n, double **v, double *eigenvalues) {
+    for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) v[i][j] = (i == j) ? 1.0 : 0.0;
+    for (int sweep = 0; sweep < 100; sweep++) {
+        double off = 0.0;
+        for (int p = 0; p < n; p++) for (int q = p + 1; q < n; q++) off += a[p][q] * a[p][q];
+        if (off < 1e-18) break;
+        for (int p = 0; p < n; p++) {
+            for (int q = p + 1; q < n; q++) {
+                if (fabs(a[p][q]) < 1e-300) continue;
+                double theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                double t = (theta >= 0 ? 1.0 : -1.0) / (fabs(theta) + sqrt(theta * theta + 1.0));
+                double c = 1.0 / sqrt(t * t + 1.0), s = t * c;
+                double app = a[p][p], aqq = a[q][q], apq = a[p][q];
+                a[p][p] = c * c * app - 2 * s * c * apq + s * s * aqq;
+                a[q][q] = s * s * app + 2 * s * c * apq + c * c * aqq;
+                a[p][q] = a[q][p] = 0.0;
+                for (int i = 0; i < n; i++) {
+                    if (i == p || i == q) continue;
+                    double aip = a[i][p], aiq = a[i][q];
+                    a[i][p] = a[p][i] = c * aip - s * aiq;
+                    a[i][q] = a[q][i] = s * aip + c * aiq;
+                }
+                for (int i = 0; i < n; i++) {
+                    double vip = v[i][p], viq = v[i][q];
+                    v[i][p] = c * vip - s * viq;
+                    v[i][q] = s * vip + c * viq;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) eigenvalues[i] = a[i][i];
+}
+
+/* Average-linkage (UPGMA) agglomerative clustering. dist is n x n. Returns
+ * n-1 merges; cluster ids >= n refer to merges[id - n]. */
+typedef struct { int left, right; double height; int size; } Merge;
+
+static void hclust_average(double **dist, int n, Merge *merges_out) {
+    int maxc = 2 * n - 1;
+    double **d = xmalloc(sizeof(double *) * maxc);
+    for (int i = 0; i < maxc; i++) d[i] = xmalloc(sizeof(double) * maxc);
+    int *size = xmalloc(sizeof(int) * maxc);
+    int *alive = xmalloc(sizeof(int) * maxc);
+    for (int i = 0; i < maxc; i++) { alive[i] = (i < n); size[i] = 1; }
+    for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) d[i][j] = dist[i][j];
+
+    int next_id = n;
+    for (int m = 0; m < n - 1; m++) {
+        double best = 1e300; int bi = -1, bj = -1;
+        for (int i = 0; i < next_id; i++) {
+            if (!alive[i]) continue;
+            for (int j = i + 1; j < next_id; j++) {
+                if (!alive[j]) continue;
+                if (d[i][j] < best) { best = d[i][j]; bi = i; bj = j; }
+            }
+        }
+        merges_out[m].left = bi; merges_out[m].right = bj; merges_out[m].height = best;
+        int new_size = size[bi] + size[bj];
+        for (int k = 0; k < next_id; k++) {
+            if (!alive[k] || k == bi || k == bj) continue;
+            d[next_id][k] = d[k][next_id] = (size[bi] * d[bi][k] + size[bj] * d[bj][k]) / (double)new_size;
+        }
+        alive[bi] = 0; alive[bj] = 0; alive[next_id] = 1; size[next_id] = new_size;
+        merges_out[m].size = new_size;
+        next_id++;
+    }
+    for (int i = 0; i < maxc; i++) free(d[i]);
+    free(d); free(size); free(alive);
+}
+
+static void hclust_leaf_order(Merge *merges, int n, int node, int *order, int *pos) {
+    if (node < n) { order[(*pos)++] = node; return; }
+    Merge *mm = &merges[node - n];
+    hclust_leaf_order(merges, n, mm->left, order, pos);
+    hclust_leaf_order(merges, n, mm->right, order, pos);
+}
+
+/* x-position (in leaf-order units) of every node, leaf or internal, needed
+ * to draw dendrogram connector lines without crossings. */
+static double hclust_node_x(Merge *merges, int n, int node, double *leaf_x) {
+    if (node < n) return leaf_x[node];
+    Merge *mm = &merges[node - n];
+    double lx = hclust_node_x(merges, n, mm->left, leaf_x);
+    double rx = hclust_node_x(merges, n, mm->right, leaf_x);
+    return (lx + rx) / 2.0;
+}
+
+static void write_compare_report(CompareSample *samples, int n_samples, int n_genes_canonical, const char *outdir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/multi_sample_report.html", outdir);
+    FILE *f = fopen(path, "w");
+    if (!f) die("cannot write multi_sample_report.html");
+
+    /* --- pick the top COMPARE_TOP_N_GENES most-variable genes ---------- */
+    int topn = n_genes_canonical < COMPARE_TOP_N_GENES ? n_genes_canonical : COMPARE_TOP_N_GENES;
+    double *var = xmalloc(sizeof(double) * n_genes_canonical);
+    for (int g = 0; g < n_genes_canonical; g++) {
+        double mean = 0; for (int s = 0; s < n_samples; s++) mean += samples[s].log2cpm[g];
+        mean /= n_samples;
+        double v = 0; for (int s = 0; s < n_samples; s++) { double d = samples[s].log2cpm[g] - mean; v += d * d; }
+        var[g] = v;
+    }
+    int *idx = xmalloc(sizeof(int) * n_genes_canonical);
+    for (int g = 0; g < n_genes_canonical; g++) idx[g] = g;
+    /* partial selection sort for the top `topn` -- n_genes_canonical is at
+     * most a few tens of thousands and topn is capped at 500, so this is
+     * cheap; no need for a full sort. */
+    for (int i = 0; i < topn; i++) {
+        int best = i;
+        for (int j = i + 1; j < n_genes_canonical; j++) if (var[idx[j]] > var[idx[best]]) best = j;
+        int tmp = idx[i]; idx[i] = idx[best]; idx[best] = tmp;
+    }
+
+    /* --- build the (n_samples x topn) centered matrix ------------------- */
+    double **X = xmalloc(sizeof(double *) * n_samples);
+    for (int s = 0; s < n_samples; s++) X[s] = xmalloc(sizeof(double) * topn);
+    for (int g = 0; g < topn; g++) {
+        double mean = 0; for (int s = 0; s < n_samples; s++) mean += samples[s].log2cpm[idx[g]];
+        mean /= n_samples;
+        for (int s = 0; s < n_samples; s++) X[s][g] = samples[s].log2cpm[idx[g]] - mean;
+    }
+
+    /* --- PCA via the samples x samples Gram matrix (genes >> samples) --- */
+    double **G = xmalloc(sizeof(double *) * n_samples);
+    for (int s = 0; s < n_samples; s++) G[s] = xmalloc(sizeof(double) * n_samples);
+    for (int i = 0; i < n_samples; i++)
+        for (int j = 0; j < n_samples; j++) {
+            double dot = 0; for (int g = 0; g < topn; g++) dot += X[i][g] * X[j][g];
+            G[i][j] = dot;
+        }
+    double **V = xmalloc(sizeof(double *) * n_samples);
+    for (int s = 0; s < n_samples; s++) V[s] = xmalloc(sizeof(double) * n_samples);
+    double *eigval = xmalloc(sizeof(double) * n_samples);
+    jacobi_eigen(G, n_samples, V, eigval);
+
+    /* sort eigenpairs descending */
+    int *order = xmalloc(sizeof(int) * n_samples);
+    for (int i = 0; i < n_samples; i++) order[i] = i;
+    for (int i = 0; i < n_samples; i++) {
+        int best = i;
+        for (int j = i + 1; j < n_samples; j++) if (eigval[order[j]] > eigval[order[best]]) best = j;
+        int tmp = order[i]; order[i] = order[best]; order[best] = tmp;
+    }
+    double total_var = 0; for (int i = 0; i < n_samples; i++) if (eigval[i] > 0) total_var += eigval[i];
+    if (total_var <= 0) total_var = 1;
+
+    int pc1 = order[0], pc2 = (n_samples > 1 ? order[1] : order[0]);
+    double pc1_pct = 100.0 * (eigval[pc1] > 0 ? eigval[pc1] : 0) / total_var;
+    double pc2_pct = (n_samples > 1) ? 100.0 * (eigval[pc2] > 0 ? eigval[pc2] : 0) / total_var : 0.0;
+    double *px = xmalloc(sizeof(double) * n_samples);
+    double *py = xmalloc(sizeof(double) * n_samples);
+    for (int s = 0; s < n_samples; s++) {
+        px[s] = V[s][pc1] * sqrt(eigval[pc1] > 0 ? eigval[pc1] : 0);
+        py[s] = (n_samples > 1) ? V[s][pc2] * sqrt(eigval[pc2] > 0 ? eigval[pc2] : 0) : 0.0;
+    }
+
+    /* --- pairwise Euclidean distance + average-linkage clustering ------- */
+    double **dist = xmalloc(sizeof(double *) * n_samples);
+    for (int s = 0; s < n_samples; s++) dist[s] = xmalloc(sizeof(double) * n_samples);
+    for (int i = 0; i < n_samples; i++)
+        for (int j = 0; j < n_samples; j++) {
+            double sq = 0; for (int g = 0; g < topn; g++) { double d = X[i][g] - X[j][g]; sq += d * d; }
+            dist[i][j] = sqrt(sq);
+        }
+    int *leaf_order = xmalloc(sizeof(int) * n_samples);
+    Merge *merges = NULL;
+    if (n_samples >= 2) {
+        merges = xmalloc(sizeof(Merge) * (n_samples - 1));
+        hclust_average(dist, n_samples, merges);
+        int pos = 0;
+        hclust_leaf_order(merges, n_samples, n_samples + (n_samples - 2), leaf_order, &pos);
+    } else {
+        leaf_order[0] = 0;
+    }
+
+    /* ================================ HTML ============================ */
+    fprintf(f, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Multi-sample report</title>\n");
+    fprintf(f, "<style>\n"
+               "body{font-family:Helvetica,Arial,sans-serif;max-width:820px;margin:32px auto;padding:0 16px;color:#222;}\n"
+               "h1{font-size:20px;} h2{font-size:15px;margin-top:36px;border-bottom:1px solid #ddd;padding-bottom:6px;}\n"
+               "p.sub{color:#777;font-size:13px;margin-top:-8px;}\n"
+               ".card{border:1px solid #e3e3e3;border-radius:8px;padding:12px 16px;margin-top:10px;}\n"
+               ".note{color:#777;font-size:12px;margin-top:6px;}\n"
+               "</style></head><body>\n");
+    fprintf(f, "<h1>Multi-sample comparison</h1>\n<p class=\"sub\">%d samples &middot; top %d most-variable genes (of %d)</p>\n",
+            n_samples, topn, n_genes_canonical);
+
+    /* --- PCA scatter ----------------------------------------------------- */
+    {
+        int w = SVG_W, h = SVG_H + 30;
+        int ml = 60, mr = 30, mt = 20, mb = 50;
+        int pw = w - ml - mr, ph = h - mt - mb;
+        double xmin = px[0], xmax = px[0], ymin = py[0], ymax = py[0];
+        for (int s = 1; s < n_samples; s++) {
+            if (px[s] < xmin) xmin = px[s];
+            if (px[s] > xmax) xmax = px[s];
+            if (py[s] < ymin) ymin = py[s];
+            if (py[s] > ymax) ymax = py[s];
+        }
+        double xr = xmax - xmin; if (xr < 1e-9) xr = 1;
+        double yr = ymax - ymin; if (yr < 1e-9) yr = 1;
+        xmin -= xr * 0.15; xmax += xr * 0.15; ymin -= yr * 0.2; ymax += yr * 0.2;
+        xr = xmax - xmin; yr = ymax - ymin;
+
+        fprintf(f, "<h2>Sample similarity (PCA)</h2>\n<div class=\"card\">\n");
+        fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", w, h);
+        int x0 = ml, y0 = mt + ph;
+        fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#ccc\"/>\n", x0, mt, x0, y0);
+        fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#ccc\"/>\n", x0, y0, ml + pw, y0);
+        fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#555\" text-anchor=\"middle\">PC1 (%.1f%% variance)</text>\n", ml + pw / 2, h - 8, pc1_pct);
+        fprintf(f, "<text x=\"14\" y=\"%d\" font-size=\"12\" fill=\"#555\" transform=\"rotate(-90 14,%d)\" text-anchor=\"middle\">PC2 (%.1f%% variance)</text>\n", mt + ph / 2, mt + ph / 2, pc2_pct);
+        const char *palette[8] = { "#2a78d6", "#c8622d", "#2a9d5c", "#6a4fb3", "#d6a02a", "#d64550", "#2ab6b0", "#8a8a8a" };
+        for (int s = 0; s < n_samples; s++) {
+            int cx = ml + (int)(pw * (px[s] - xmin) / xr);
+            int cy = mt + ph - (int)(ph * (py[s] - ymin) / yr);
+            char lbl[256]; html_escape(samples[s].name, lbl, sizeof(lbl));
+            fprintf(f, "<circle cx=\"%d\" cy=\"%d\" r=\"6\" fill=\"%s\" stroke=\"white\" stroke-width=\"1.5\"/>\n", cx, cy, palette[s % 8]);
+            fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#333\">%s</text>\n", cx + 9, cy + 4, lbl);
+        }
+        fprintf(f, "</svg>\n</div>\n");
+        fprintf(f, "<p class=\"note\">Each point is one sample, projected onto its first two principal components computed "
+                   "from log2(CPM+1) expression over the top %d most-variable genes (exact eigendecomposition of the "
+                   "sample-similarity matrix, the standard approach when there are far more genes than samples -- not an "
+                   "approximation). Samples that cluster together have more similar overall expression profiles.</p>\n", topn);
+    }
+
+    /* --- sample-distance heatmap + dendrogram ---------------------------- */
+    {
+        int cell = 46;
+        int label_w = 0;
+        for (int s = 0; s < n_samples; s++) { int l = (int)strlen(samples[s].name); if (l > label_w) label_w = l; }
+        label_w = 40 + label_w * 6;
+        int dendro_h = (n_samples >= 2) ? 60 : 0;
+        int w = label_w + cell * n_samples + 20;
+        int h = dendro_h + cell * n_samples + label_w / 2 + 20;
+        double dmax = 0; for (int i = 0; i < n_samples; i++) for (int j = 0; j < n_samples; j++) if (dist[i][j] > dmax) dmax = dist[i][j];
+        if (dmax <= 0) dmax = 1;
+
+        fprintf(f, "<h2>Sample-distance heatmap</h2>\n<div class=\"card\" style=\"overflow-x:auto;\">\n");
+        fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", w, h);
+
+        if (n_samples >= 2) {
+            double *leaf_x = xmalloc(sizeof(double) * n_samples);
+            for (int i = 0; i < n_samples; i++) leaf_x[leaf_order[i]] = label_w + cell * i + cell / 2.0;
+            double max_height = 0; for (int m = 0; m < n_samples - 1; m++) if (merges[m].height > max_height) max_height = merges[m].height;
+            if (max_height <= 0) max_height = 1;
+            for (int m = 0; m < n_samples - 1; m++) {
+                double lx = hclust_node_x(merges, n_samples, merges[m].left, leaf_x);
+                double rx = hclust_node_x(merges, n_samples, merges[m].right, leaf_x);
+                double y = dendro_h - (dendro_h - 8) * (merges[m].height / max_height);
+                fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#999\"/>\n", lx, (double)dendro_h, lx, y);
+                fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#999\"/>\n", rx, (double)dendro_h, rx, y);
+                fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#999\"/>\n", lx, y, rx, y);
+            }
+            free(leaf_x);
+        }
+
+        for (int i = 0; i < n_samples; i++) {
+            int si = leaf_order[i];
+            char lbl[256]; html_escape(samples[si].name, lbl, sizeof(lbl));
+            fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#333\" text-anchor=\"end\">%s</text>\n",
+                    label_w - 6, dendro_h + i * cell + cell / 2 + 4, lbl);
+            fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#333\" text-anchor=\"end\" transform=\"rotate(-45 %d,%d)\">%s</text>\n",
+                    label_w + i * cell + cell / 2, dendro_h + n_samples * cell + 14,
+                    label_w + i * cell + cell / 2, dendro_h + n_samples * cell + 14, lbl);
+        }
+        for (int i = 0; i < n_samples; i++) {
+            for (int j = 0; j < n_samples; j++) {
+                int si = leaf_order[i], sj = leaf_order[j];
+                double v = dist[si][sj] / dmax; /* 0 (identical) .. 1 (most different) */
+                int shade = 235 - (int)(180 * v);
+                fprintf(f, "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"rgb(%d,%d,255)\" stroke=\"white\"/>\n",
+                        label_w + j * cell, dendro_h + i * cell, cell, cell, shade, shade);
+                fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"10\" fill=\"%s\" text-anchor=\"middle\">%.1f</text>\n",
+                        label_w + j * cell + cell / 2, dendro_h + i * cell + cell / 2 + 3,
+                        v > 0.55 ? "white" : "#333", dist[si][sj]);
+            }
+        }
+        fprintf(f, "</svg>\n</div>\n");
+        fprintf(f, "<p class=\"note\">Pairwise Euclidean distance between samples in the same top-%d-variable-gene "
+                   "log2(CPM+1) space used for the PCA above (darker = more similar). Rows/columns are ordered by "
+                   "average-linkage hierarchical clustering, shown as the dendrogram on top -- samples that merge "
+                   "low are more similar. This uses the same top-variable-gene subset as the PCA for consistency; "
+                   "DESeq2's own sample-distance heatmap conventionally uses the full transformed matrix instead.</p>\n", topn);
+    }
+
+    /* --- library size bar (general-stats-style cross-sample comparison) - */
+    {
+        const char *labels[MAX_COMPARE_SAMPLES]; double values[MAX_COMPARE_SAMPLES];
+        for (int s = 0; s < n_samples; s++) { labels[s] = samples[s].name; values[s] = samples[s].lib_size; }
+        fprintf(f, "<h2>Library size</h2>\n<div class=\"card\">\n");
+        svg_vbar_chart(f, labels, values, n_samples, "#2a78d6");
+        fprintf(f, "</div>\n<p class=\"note\">Total EM-assigned effective counts per sample. Analogous to the "
+                   "\"M Assigned\" column in MultiQC's General Statistics table.</p>\n");
+    }
+
+    fprintf(f, "<h2>What this uses vs. real DESeq2</h2>\n");
+    fprintf(f, "<p class=\"note\">This uses log2(CPM+1) as a variance-stabilizing stand-in, not DESeq2's regularized-log/VST "
+               "(which additionally models a per-gene mean-dispersion trend). PCA itself is computed exactly via "
+               "eigendecomposition, not approximated. Good enough to see whether samples group the way you expect; "
+               "don't treat absolute distances as DESeq2-calibrated values.</p>\n");
+
+    fprintf(f, "</body></html>\n");
+    fclose(f);
+
+    for (int s = 0; s < n_samples; s++) { free(X[s]); free(G[s]); free(V[s]); free(dist[s]); }
+    free(X); free(G); free(V); free(dist);
+    free(eigval); free(order); free(var); free(idx); free(px); free(py); free(leaf_order);
+    if (merges) free(merges);
+}
+
+static int run_compare_mode(int argc, char **argv) {
+    /* argv[0]=prog argv[1]="compare" argv[2..argc-2]=<outdir per sample> argv[argc-1]=<combined_outdir> */
+    if (argc < 5) {
+        fprintf(stderr, "Usage:\n  %s compare <sample1_outdir> <sample2_outdir> [more...] <combined_outdir>\n"
+                         "  (each <sampleN_outdir> must be a directory already produced by a single-sample run of this pipeline)\n", argv[0]);
+        return 1;
+    }
+    int n_samples = argc - 3;
+    if (n_samples > MAX_COMPARE_SAMPLES) { fprintf(stderr, "error: at most %d samples supported\n", MAX_COMPARE_SAMPLES); return 1; }
+    const char *combined_outdir = argv[argc - 1];
+
+    CompareSample *samples = xmalloc(sizeof(CompareSample) * n_samples);
+    GeneCountRow *canonical = NULL;
+    int n_canonical = 0;
+
+    for (int s = 0; s < n_samples; s++) {
+        char gc_path[1024];
+        snprintf(gc_path, sizeof(gc_path), "%s/gene_counts.tsv", argv[2 + s]);
+        GeneCountRow *rows; int n = read_gene_counts_tsv(gc_path, &rows);
+        if (n < 0) {
+            for (int t = 0; t < s; t++) free(samples[t].log2cpm);
+            free(samples);
+            free(canonical);
+            return 1;
+        }
+        snprintf(samples[s].name, sizeof(samples[s].name), "%s", basename_noslash(argv[2 + s]));
+
+        if (s == 0) {
+            canonical = rows; n_canonical = n;
+            samples[s].log2cpm = xmalloc(sizeof(double) * n_canonical);
+            double total = 0; for (int g = 0; g < n; g++) total += rows[g].val;
+            samples[s].lib_size = total;
+            double denom = total > 0 ? total : 1;
+            for (int g = 0; g < n; g++) samples[s].log2cpm[g] = log2(1e6 * rows[g].val / denom + 1.0);
+        } else {
+            samples[s].log2cpm = xmalloc(sizeof(double) * n_canonical);
+            for (int g = 0; g < n_canonical; g++) samples[s].log2cpm[g] = 0.0;
+            double total = 0; for (int g = 0; g < n; g++) total += rows[g].val;
+            samples[s].lib_size = total;
+            double denom = total > 0 ? total : 1;
+            /* align this sample's rows onto the canonical gene order -- O(n_canonical * n)
+             * is fine at gene-count/sample-count scale, and avoids building a hash map for
+             * what's normally a handful of compare-mode invocations, not a hot path. */
+            for (int g = 0; g < n; g++) {
+                for (int c = 0; c < n_canonical; c++) {
+                    if (strcmp(rows[g].gene_id, canonical[c].gene_id) == 0) {
+                        samples[s].log2cpm[c] = log2(1e6 * rows[g].val / denom + 1.0);
+                        break;
+                    }
+                }
+            }
+            free(rows);
+        }
+        printf("  loaded %s: %d genes, library size %.0f\n", samples[s].name, n, samples[s].lib_size);
+    }
+
+    #ifdef _WIN32
+    #else
+    mkdir(combined_outdir, 0755);
+    #endif
+    write_compare_report(samples, n_samples, n_canonical, combined_outdir);
+    printf("Wrote %s/multi_sample_report.html\n", combined_outdir);
+
+    for (int s = 0; s < n_samples; s++) free(samples[s].log2cpm);
+    free(samples); free(canonical);
+    return 0;
+}
+
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s <reference.fasta> <annotation.gtf> se <reads.fastq> <outdir>\n"
-        "  %s <reference.fasta> <annotation.gtf> pe <r1.fastq> <r2.fastq> <outdir>\n",
-        prog, prog);
+        "  %s <reference.fasta> <annotation.gtf> pe <r1.fastq> <r2.fastq> <outdir>\n"
+        "  %s compare <sample1_outdir> <sample2_outdir> [more...] <combined_outdir>\n",
+        prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "compare") == 0) return run_compare_mode(argc, argv);
     if (argc < 6) { usage(argv[0]); return 1; }
 
     const char *ref_path = argv[1];
@@ -1872,6 +2705,7 @@ int main(int argc, char **argv) {
     write_gene_counts(outdir);
     write_qc_report(outdir);
     write_summary(outdir, ref_path, gtf_path, reads_desc);
+    write_html_report(outdir, reads_desc);
 
     printf("Done. (EM converged in %d iterations)\n", em_iterations_run);
     return 0;

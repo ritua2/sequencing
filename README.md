@@ -30,7 +30,9 @@ gunzip -k reads_1.fastq.gz reads_2.fastq.gz
 ```
 
 For the data set in the attached directory:
+```
 ./rnaseq_pipeline genome.fa yeast.gtf pe reads_1.fastq reads_2.fastq outdir/
+```
 
 Below is the command used to time the jobrun using the yeast.gtf created in step 3 below.
 ```

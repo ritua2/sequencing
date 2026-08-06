@@ -12,35 +12,9 @@ Or with OpenMP for multi-core parallelism (worth using if your machine has more 
 gcc -O2 -fopenmp -o rnaseq_pipeline rnaseq_pipeline.c -lm
 ```
 
-## 2. Run
+## 2. Annotation format — one thing to watch for
 
-**Paired-end** (e.g., with `SRR9336476`):
-```bash
-./rnaseq_pipeline genome.fa annotation.gtf pe reads_1.fastq reads_2.fastq outdir/
-```
-
-**Single-end:**
-```bash
-./rnaseq_pipeline genome.fa annotation.gtf se reads.fastq outdir/
-```
-
-Reads can be plain `.fastq` — the pipeline doesn't read `.gz` directly, so `gunzip` first:
-```bash
-gunzip -k reads_1.fastq.gz reads_2.fastq.gz
-```
-
-For the data set in the attached directory:
-```
-./rnaseq_pipeline genome.fa yeast.gtf pe reads_1.fastq reads_2.fastq outdir/
-```
-
-Below is the command used to time the jobrun using the yeast.gtf created in step 3 below.
-```
-time ./rnaseq_pipeline Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa yeast.gtf pe 1M_SRR9336468_1.fastq 1M_SRR9336468_2.fastq ./outdir/
-```
-## 3. Annotation format — one thing to watch for
-
-The pipeline expects **GTF**, not GFF3. The annotation file whose link is given in the data folder is in GFF3 format, so it has to be converted before testing. If you're working from the same Ensembl-style GFF3, you'll need to do the same — a minimal gene-level conversion:
+The pipeline expects **GTF**, not GFF3. The gene id and gene location information is in the GFF3 file, so it has to be converted before testing. If you are working from the same Ensembl-style GFF3, you'll need to do the same — a minimal gene-level conversion:
 
 ```bash
 python3 -c "
@@ -58,10 +32,41 @@ with gzip.open('annotation.gff3.gz','rt') as f, open('annotation.gtf','w') as ou
 ```
 Or
 
-Use the convert_gff3_to_gtk.py code and run it as follows:
+Use the convert_gff3_to_gtk.py code and run it as below. For the sample dataset, check the link in the the data folder of this repo and download RNA-Seq_Sample_Files. From inside the RNA-Seq_Sample_Files folder, run the following command (assuming that *.py file is in the folder one level up) to convert the *.gff3.gz file into a *.gtf file.
 
 ```
-python3 gff3_to_gtf.py Saccharomyces_cerevisiae_R64-1-1_59_gff3.gz yeast.gtf
+python3 ../convert_gff3_to_gtf.py Saccharomyces_cerevisiae.R64-1-1.59.gff3.gz yeast.gtf
+```
+
+## 3. Run
+
+Before running the code, ensure that the input files are available.
+
+**Paired-end** (e.g., with `SRR9336476`):
+```bash
+./rnaseq_pipeline genome.fa annotation.gtf pe reads_1.fastq reads_2.fastq outdir/
+```
+
+**Single-end:**
+```bash
+./rnaseq_pipeline genome.fa annotation.gtf se reads.fastq outdir/
+```
+
+Reads can be plain `.fastq` — the pipeline doesn't read `.gz` directly, so `gunzip` first:
+```bash
+gunzip -k reads_1.fastq.gz reads_2.fastq.gz
+```
+
+Using the sample data set downloaded from the link in the data directory of this repo, and after creating yeast.gtf in step 2, you can test the code as follows:
+
+```
+time ./rnaseq_pipeline RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
+```
+
+Note: If the files in the downloaded dataset folder are in *.gz format, then run the following command to convert the files into *.fastq format before rnning the steps above:
+
+```
+gunzip *
 ```
 
 ## 4. What you will see

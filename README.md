@@ -42,6 +42,8 @@ python3 ../convert_gff3_to_gtf.py Saccharomyces_cerevisiae.R64-1-1.59.gff3.gz ye
 
 Before running the code, ensure that the input files are available.
 
+## SERIAL RUN:
+
 **Paired-end** (e.g., with `SRR9336476`):
 ```bash
 ./rnaseq_pipeline genome.fa annotation.gtf pe reads_1.fastq reads_2.fastq outdir/
@@ -64,6 +66,25 @@ Using the sample data set downloaded from the link in the data directory of this
 time ./rnaseq_pipeline RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
 ```
 
+## PARALLEL RUN
+Set the OMP_NUM_THREADS variable to the number of threads that you would like to run the code with to reduce the overall run-time.
+
+```
+export OMP_NUM_THREADS=4
+```
+
+You can set OMP_NUM_THREADS to the maximum number of cores available on the CPU on which you will be running the code.
+
+Make sure to compile the code with the -fopenmp flag.
+
+```bash
+gcc -O2 -fopenmp -o rnaseq_pipeline_omp rnaseq_pipeline.c -lm
+```
+
+Then, run the code as follows (similar to the command for the serial run):
+```
+time ./rnaseq_pipeline_omp RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
+```
 
 ## 4. What you will see
 

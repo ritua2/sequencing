@@ -63,11 +63,6 @@ Using the sample data set downloaded from the link in the data directory of this
 time ./rnaseq_pipeline RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
 ```
 
-Note: If the files in the downloaded dataset folder are in *.gz format, then run the following command to convert the files into *.fastq format before rnning the steps above:
-
-```
-gunzip *
-```
 
 ## 4. What you will see
 

@@ -53,6 +53,7 @@ Before running the code, ensure that the input files are available.
 ```
 
 Reads can be plain `.fastq` — the pipeline doesn't read `.gz` directly, so `gunzip` first:
+
 ```bash
 gunzip -k reads_1.fastq.gz reads_2.fastq.gz
 ```

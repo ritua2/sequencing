@@ -135,12 +135,39 @@
 #define SW_MAX_CANDIDATES           8   /* cap on distinct seed-derived candidate windows
                                             actually run through full SW, per orientation --
                                             bounds worst-case cost in repetitive regions */
-#define MAX_CIGAR_OPS               12   /* real single-intron spliced (M/N/M) and indel-bearing
-                                            SW alignments never come close to this: profiling a
-                                            100,000-read run against the full 12Mb S. cerevisiae
-                                            R64-1-1 genome showed a max of 9 ops on any single
-                                            alignment. Was 24, costing 2x the CigarOp memory for
-                                            headroom nothing in real data ever used. */
+#define MAX_CIGAR_OPS               16   /* Bug found in production validation against a real
+                                            1M-read-pair S. cerevisiae dataset: a value of 12 here
+                                            is not enough headroom -- 20 of ~2M alignments in that
+                                            run (~0.001%) hit indel-dense regions (many short I/D
+                                            runs over homopolymer/low-complexity stretches) that
+                                            produced 12+ distinct CIGAR ops, silently truncating the
+                                            emitted CIGAR. Two independent fixes address this: (1)
+                                            this bound was raised (was tried at 48, see below for
+                                            why that's not the value actually shipped), and (2) the
+                                            CIGAR write-out in sw_local_align now unconditionally
+                                            reconciles emitted-op length against qlen by folding any
+                                            un-emitted bases into the trailing soft-clip, so
+                                            correctness no longer *depends* on this bound being large
+                                            enough -- truncation now degrades to "slightly more
+                                            aggressive soft-clip on a vanishingly rare pathological
+                                            read" instead of "invalid SAM record".  That decoupling
+                                            matters because this value has a real memory cost: it's
+                                            embedded directly in every Hit (CigarOp cigar[N]), and
+                                            Hits scale with total reads x average hits/read across a
+                                            multi-million-read run. Trying 48 (4x the original) was
+                                            enough extra resident memory, on top of the k-mer index
+                                            and the full reads[] array already in memory for a
+                                            1M-read-pair run, to OOM-kill the process in a
+                                            memory-constrained (4GB) environment when the
+                                            end-of-run `samtools sort` subprocess needed its own
+                                            memory on top of that. 16 keeps real headroom over the
+                                            originally-profiled max of 9 ops/alignment while costing
+                                            far less than 48 -- see the memory-architecture note in
+                                            README.md's Known gaps section for the broader point
+                                            this surfaced (this pipeline has only been validated at
+                                            S. cerevisiae genome scale, not human/mouse scale, and
+                                            its static-hash-table k-mer index is not evidence of
+                                            scaling gracefully to a genome 250x larger). */
 
 /* --- EM quantification parameters --- */
 #define MAX_GENES_PER_UNIT          8   /* cap on candidate genes for one read/fragment */
@@ -163,6 +190,12 @@ typedef struct {
     long start;   /* 1-based inclusive, like GTF */
     long end;     /* 1-based inclusive */
     char strand;  /* '+' or '-' */
+    char biotype[32]; /* from GTF gene_biotype attribute if present, else "unknown".
+                          Used for the rRNA-content QC diagnostic below -- not used
+                          in alignment/quantification, so its absence/inaccuracy in
+                          a GTF that doesn't carry gene_biotype degrades gracefully
+                          (everything just reads as "unknown", no crash, no wrong
+                          counts). */
     long   unique_count;     /* reads/fragments uniquely assigned (hard count) */
     double effective_count;  /* EM expected count, incl. proportional multi-mapper share */
 } Gene;
@@ -197,6 +230,13 @@ typedef struct {
                   * to sizeof(Read), and was what forced capping real full-genome runs in
                   * this session to 100,000 of the 1,000,000 available reads to fit in
                   * available memory. */
+    int is_duplicate; /* set by umi_dedup() when --umi-len is used: this read (and its
+                          mate, if paired) is a PCR/optical duplicate of another unit
+                          sharing the same (chrom, alignment position, strand, UMI).
+                          Always 0 if UMI dedup isn't enabled. Excluded from
+                          quantification but still written to SAM/BAM with the 0x400
+                          duplicate flag, matching standard practice (UMI-tools dedup +
+                          picard MarkDuplicates both mark rather than delete). */
 } AlignResult;
 
 /* Set of candidate gene indices a read/fragment could plausibly belong to,
@@ -207,6 +247,8 @@ typedef struct {
     int idx[MAX_GENES_PER_UNIT];
     int n;
 } GeneSet;
+
+#define MAX_UMI_LEN 20
 
 typedef struct {
     char id[MAX_SEQNAME];
@@ -222,6 +264,7 @@ typedef struct {
 
     int    read_num;   /* 0 = single-end, 1 = R1, 2 = R2 */
     int    mate_idx;   /* index into reads[] of mate, or -1 */
+    char   umi[MAX_UMI_LEN + 1]; /* extracted by extract_umis(), empty if --umi-len not given */
 
     AlignResult aln;
     GeneSet candidates; /* filled during quantify_em() */
@@ -247,6 +290,66 @@ static long n_spliced_alignments = 0;
 static long n_ungapped_alignments = 0;
 static long n_proper_pairs = 0;
 static long n_unique_units = 0, n_multi_units = 0, n_no_feature_units = 0, n_unmapped_units = 0;
+static long last_strand_concordant = 0, last_strand_discordant = 0;
+
+/* Classifies a strandedness verdict from concordant/discordant counts among
+ * uniquely-assigned fragments, using the same rough thresholds RSeQC's
+ * infer_experiment.py uses in practice: >~80% one way is called stranded,
+ * otherwise unstranded. Returns a short label and writes a one-line
+ * human-readable summary into *msg (caller-provided buffer). */
+static const char *classify_strandedness(long concordant, long discordant, char *msg, size_t msgsz) {
+    long total = concordant + discordant;
+    if (total < 100) {
+        snprintf(msg, msgsz, "too few uniquely-assigned reads (%ld) to call confidently", total);
+        return "indeterminate";
+    }
+    double frac_concordant = (double)concordant / (double)total;
+    if (frac_concordant >= 0.8) {
+        snprintf(msg, msgsz, "%.1f%% of uniquely-assigned reads have read1 on the gene's strand", 100.0 * frac_concordant);
+        return "forward-stranded (read1 = sense)";
+    } else if (frac_concordant <= 0.2) {
+        snprintf(msg, msgsz, "%.1f%% of uniquely-assigned reads have read1 opposite the gene's strand", 100.0 * (1.0 - frac_concordant));
+        return "reverse-stranded (read1 = antisense, e.g. Illumina TruSeq Stranded mRNA / dUTP)";
+    } else {
+        snprintf(msg, msgsz, "%.1f%% / %.1f%% split -- no strong strand preference", 100.0 * frac_concordant, 100.0 * (1.0 - frac_concordant));
+        return "unstranded";
+    }
+}
+
+/* rRNA-content QC (the actual QC question SortMeRNA/BBSplit-style rRNA
+ * screening exists to answer: "how much of this library is ribosomal
+ * RNA?"), computed from the annotation itself rather than by aligning
+ * against a separate rRNA reference database. This is a genuinely
+ * different mechanism from SortMeRNA (which flags/removes rRNA reads
+ * *before* alignment, working even for rRNA sequence not present in the
+ * genome/annotation, e.g. contaminating rRNA from a different organism),
+ * but for the common case -- quantifying rRNA content from the organism's
+ * own annotated rRNA loci -- it answers the same question with no extra
+ * reference data required, using gene_biotype from the GTF (see
+ * convert_gff3_to_gtf.py, which now carries this through from Ensembl-style
+ * GFF3's biotype= attribute). Degrades gracefully to "unknown" biotype
+ * (and a note that biotype info wasn't available) for GTFs that don't
+ * carry gene_biotype at all -- this never blocks a run, it's diagnostic
+ * only, exactly like the strandedness check above. */
+typedef struct { double rrna, trna, protein_coding, other, unknown, total; } BiotypeBreakdown;
+
+static BiotypeBreakdown compute_biotype_breakdown(void) {
+    BiotypeBreakdown b = {0,0,0,0,0,0};
+    int any_known_biotype = 0;
+    for (int i = 0; i < n_genes; i++) {
+        double c = genes[i].effective_count;
+        b.total += c;
+        if (strcmp(genes[i].biotype, "unknown") != 0) any_known_biotype = 1;
+        if (strcmp(genes[i].biotype, "rRNA") == 0) b.rrna += c;
+        else if (strcmp(genes[i].biotype, "tRNA") == 0) b.trna += c;
+        else if (strcmp(genes[i].biotype, "protein_coding") == 0) b.protein_coding += c;
+        else if (strcmp(genes[i].biotype, "unknown") == 0) b.unknown += c;
+        else b.other += c;
+    }
+    if (!any_known_biotype) { b.unknown = b.total; b.rrna = b.trna = b.protein_coding = b.other = 0; }
+    return b;
+}
+
 static int  em_iterations_run = 0;
 static double em_final_delta = 0.0;
 
@@ -304,11 +407,63 @@ static long lmin(long a, long b) { return a < b ? a : b; }
 static long lmax(long a, long b) { return a > b ? a : b; }
 
 /* ---------------------------------------------------------------------- */
+/* Transparent gzip input support                                         */
+/* ---------------------------------------------------------------------- */
+/* nf-core/rnaseq (and essentially every real dataset) takes .fastq.gz /
+ * .fa.gz / .gtf.gz directly; this pipeline previously required the caller
+ * to pre-decompress everything, which was the single highest-friction gap
+ * vs. real usage. Rather than link zlib (an extra build dependency), shell
+ * out to `gunzip -c` via popen for any path ending in .gz -- gzip/gunzip is
+ * present on essentially every Linux/macOS system already, including every
+ * environment this pipeline has been built and tested in. Falls back to a
+ * plain fopen for everything else, so uncompressed inputs are unaffected. */
+static int has_gz_suffix(const char *path) {
+    size_t len = strlen(path);
+    return (len > 3 && strcmp(path + len - 3, ".gz") == 0);
+}
+
+/* Wraps a shell path in single quotes, escaping any embedded single quotes
+ * (path' -> path'\''), so filenames with spaces/special chars are safe to
+ * pass through popen("gunzip -c '...'"). */
+static void shell_quote(const char *path, char *out, size_t outsz) {
+    size_t o = 0;
+    if (o < outsz - 1) out[o++] = '\'';
+    for (const char *p = path; *p && o < outsz - 5; p++) {
+        if (*p == '\'') { out[o++] = '\''; out[o++] = '\\'; out[o++] = '\''; out[o++] = '\''; }
+        else out[o++] = *p;
+    }
+    if (o < outsz - 1) out[o++] = '\'';
+    out[o] = '\0';
+}
+
+/* Opens path for reading, transparently gunzipping if it ends in .gz.
+ * *is_pipe is set so the caller knows whether to pclose() or fclose(). */
+static FILE *open_maybe_gz(const char *path, int *is_pipe) {
+    if (has_gz_suffix(path)) {
+        char quoted[MAX_LINE];
+        shell_quote(path, quoted, sizeof(quoted));
+        char cmd[MAX_LINE + 32];
+        snprintf(cmd, sizeof(cmd), "gunzip -c %s", quoted);
+        *is_pipe = 1;
+        FILE *f = popen(cmd, "r");
+        return f; /* NULL on failure, same contract as fopen */
+    }
+    *is_pipe = 0;
+    return fopen(path, "r");
+}
+
+static void close_maybe_gz(FILE *f, int is_pipe) {
+    if (!f) return;
+    if (is_pipe) pclose(f); else fclose(f);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Reference FASTA parsing                                                */
 /* ---------------------------------------------------------------------- */
 
 static void load_reference(const char *path) {
-    FILE *f = fopen(path, "r");
+    int is_pipe;
+    FILE *f = open_maybe_gz(path, &is_pipe);
     if (!f) die("cannot open reference FASTA");
 
     char line[MAX_LINE];
@@ -347,7 +502,7 @@ static void load_reference(const char *path) {
         chroms[n_chroms].len = (long)seqlen;
         n_chroms++;
     }
-    fclose(f);
+    close_maybe_gz(f, is_pipe);
     if (n_chroms == 0) die("no sequences found in reference FASTA");
 }
 
@@ -727,7 +882,8 @@ static void extract_attr(const char *attrs, const char *key, char *out, size_t o
 }
 
 static void load_gtf(const char *path) {
-    FILE *f = fopen(path, "r");
+    int is_pipe;
+    FILE *f = open_maybe_gz(path, &is_pipe);
     if (!f) die("cannot open GTF annotation");
 
     char line[MAX_LINE];
@@ -772,6 +928,8 @@ static void load_gtf(const char *path) {
             g->start = start;
             g->end = end;
             g->strand = strand_s[0];
+            extract_attr(attrs, "gene_biotype", g->biotype, sizeof(g->biotype));
+            if (g->biotype[0] == '\0') strncpy(g->biotype, "unknown", sizeof(g->biotype) - 1);
             g->unique_count = 0;
             g->effective_count = 0.0;
         } else {
@@ -779,7 +937,7 @@ static void load_gtf(const char *path) {
             if (end > genes[idx].end) genes[idx].end = end;
         }
     }
-    fclose(f);
+    close_maybe_gz(f, is_pipe);
     if (n_genes == 0) die("no gene-bearing features (gene/transcript/exon/CDS/...) found in GTF");
 }
 
@@ -882,7 +1040,8 @@ static void init_read_slot(Read *r, const char *id_line, const char *seq_line,
 }
 
 static void load_fastq_se(const char *path) {
-    FILE *f = fopen(path, "r");
+    int is_pipe;
+    FILE *f = open_maybe_gz(path, &is_pipe);
     if (!f) die("cannot open FASTQ reads file");
     reads = xmalloc(sizeof(Read) * MAX_READS);
 
@@ -897,14 +1056,15 @@ static void load_fastq_se(const char *path) {
         init_read_slot(&reads[n_reads], l1, l2, l4, 0, -1);
         n_reads++;
     }
-    fclose(f);
+    close_maybe_gz(f, is_pipe);
     if (n_reads == 0) die("no reads found in FASTQ file");
 }
 
 static void load_fastq_pe(const char *path1, const char *path2) {
-    FILE *f1 = fopen(path1, "r");
+    int is_pipe1, is_pipe2;
+    FILE *f1 = open_maybe_gz(path1, &is_pipe1);
     if (!f1) die("cannot open R1 FASTQ file");
-    FILE *f2 = fopen(path2, "r");
+    FILE *f2 = open_maybe_gz(path2, &is_pipe2);
     if (!f2) die("cannot open R2 FASTQ file");
 
     reads = xmalloc(sizeof(Read) * MAX_READS);
@@ -930,7 +1090,7 @@ static void load_fastq_pe(const char *path1, const char *path2) {
         if (strcmp(reads[i1].id, reads[i2].id) != 0) mismatched_ids++;
         n_reads += 2;
     }
-    fclose(f1); fclose(f2);
+    close_maybe_gz(f1, is_pipe1); close_maybe_gz(f2, is_pipe2);
     if (n_reads == 0) die("no read pairs found in FASTQ files");
     if (mismatched_ids)
         fprintf(stderr, "WARNING: %d read pair(s) had mismatched IDs between R1/R2 (order-based pairing used anyway)\n",
@@ -940,6 +1100,44 @@ static void load_fastq_pe(const char *path1, const char *path2) {
 /* ---------------------------------------------------------------------- */
 /* QC (pre-trim)                                                          */
 /* ---------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------- */
+/* UMI extraction (optional, --umi-len N)                                 */
+/* ---------------------------------------------------------------------- */
+
+/* Extracts a fixed-length UMI from the start of each read's mate-1 (or the
+ * read itself, single-end) -- the common in-line UMI layout (e.g.
+ * QIAseq/NEBNext-style kits: UMI + spacer trimmed from R1's 5' end before
+ * the biological insert). This is a deliberate, documented scope choice,
+ * not full generality: protocols that put the UMI on R2, split it across
+ * both mates, or use a separate index read entirely are not handled --
+ * see README.md's UMI section for what would be needed to extend this.
+ * The UMI bases are removed from the read's usable sequence (hard-clipped,
+ * like adapter trimming) so they never end up seeding/extending an
+ * alignment as if they were genomic sequence. Called once, right after
+ * FASTQ loading and before QC/trimming/alignment. */
+static void extract_umis(int umi_len) {
+    if (umi_len <= 0) return;
+    for (int i = 0; i < n_reads; i++) {
+        Read *r = &reads[i];
+        if (r->read_num == 2) continue; /* R2: UMI already extracted from its R1 mate */
+        if (r->raw_len <= umi_len) continue; /* too short to have both a UMI and any insert */
+        memcpy(r->umi, r->seq, umi_len);
+        r->umi[umi_len] = '\0';
+        if (r->read_num == 1 && r->mate_idx >= 0) {
+            /* propagate to the mate so both halves of a fragment carry the
+             * same UMI string for the dedup key later */
+            strncpy(reads[r->mate_idx].umi, r->umi, MAX_UMI_LEN);
+            reads[r->mate_idx].umi[MAX_UMI_LEN] = '\0';
+        }
+        int new_len = r->raw_len - umi_len;
+        memmove(r->seq, r->seq + umi_len, new_len);
+        memmove(r->qual, r->qual + umi_len, new_len);
+        r->seq[new_len] = '\0';
+        r->qual[new_len] = '\0';
+        r->raw_len = new_len;
+    }
+}
 
 static void compute_raw_qc(Read *r) {
     int gc = 0, n = 0;
@@ -1150,16 +1348,46 @@ static int sw_local_align(const Chrom *chrom, long window_start, long window_len
 
 #undef SWIDX
 
+    /* Write the CIGAR out, tracking exactly how many query bases (M/I/S)
+     * have actually been placed into out->cigar as we go. If the op cap is
+     * ever hit -- rev_ops[] is bounded by MAX_CIGAR_OPS-1 in the traceback
+     * loop above, and out->cigar[] by MAX_CIGAR_OPS here -- any bases that
+     * didn't make it into an emitted op are folded into the trailing
+     * soft-clip rather than silently dropped. This guarantees
+     * sum(M/I/S lengths in the emitted CIGAR) == qlen unconditionally, which
+     * is required for the CIGAR to describe the SEQ field at all (a mismatch
+     * there is rejected by samtools/picard/any correct SAM consumer). See
+     * the MAX_CIGAR_OPS comment above for how this was found. */
     out->n_cigar = 0;
-    if (start_i > 0) { out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = start_i; out->n_cigar++; }
+    int q_placed = 0; /* query bases accounted for by ops emitted so far */
+    if (start_i > 0) {
+        out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = start_i; out->n_cigar++;
+        q_placed += start_i;
+    }
     for (int k = n_rev - 1; k >= 0 && out->n_cigar < MAX_CIGAR_OPS; k--) {
         if (out->n_cigar > 0 && out->cigar[out->n_cigar-1].op == rev_ops[k].op) out->cigar[out->n_cigar-1].len += rev_ops[k].len;
         else { out->cigar[out->n_cigar] = rev_ops[k]; out->n_cigar++; }
+        if (rev_ops[k].op == 'M' || rev_ops[k].op == 'I') q_placed += rev_ops[k].len;
     }
-    int trailing_clip = qlen - best_i;
-    if (trailing_clip > 0 && out->n_cigar < MAX_CIGAR_OPS) {
-        if (out->n_cigar > 0 && out->cigar[out->n_cigar-1].op == 'S') out->cigar[out->n_cigar-1].len += trailing_clip;
-        else { out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = trailing_clip; out->n_cigar++; }
+    /* Any traceback ops that couldn't be emitted (rev_ops truncated by the
+     * MAX_CIGAR_OPS-1 walk cap, or out->cigar filled up above) still
+     * consumed query bases between start_i and best_i; qlen - best_i is the
+     * separately-tracked trailing local-alignment clip. Both gaps collapse
+     * into one soft-clip so the total always reconciles to qlen. */
+    int trailing_clip = qlen - q_placed;
+    if (trailing_clip > 0) {
+        if (out->n_cigar > 0 && out->cigar[out->n_cigar-1].op == 'S') {
+            out->cigar[out->n_cigar-1].len += trailing_clip;
+        } else if (out->n_cigar < MAX_CIGAR_OPS) {
+            out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = trailing_clip; out->n_cigar++;
+        } else {
+            /* Every slot is full (should not happen at MAX_CIGAR_OPS=48 for
+             * real short-read data) -- extend the last op rather than drop
+             * bases. This changes what the last op "means" in a pathological
+             * case, but an inflated M/I run is still a valid, length-correct
+             * CIGAR, whereas silently short-counting SEQ is not. */
+            out->cigar[out->n_cigar-1].len += trailing_clip;
+        }
     }
 
     out->ref_start = window_start + j; /* j now holds the ref offset where alignment starts */
@@ -1518,6 +1746,72 @@ static void align_read(Read *r) {
 /* resolution, simplified: no fragment-length or sequence-bias model).    */
 /* ---------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------- */
+/* UMI-aware duplicate marking (optional, --umi-len N)                    */
+/* ---------------------------------------------------------------------- */
+
+/* This is UMI-tools' "unique" method, not its default "directional"
+ * method: two units are duplicates if they have the *exact* same (chrom,
+ * alignment start, strand, UMI string) -- no allowance for a UMI that
+ * differs by one sequencing error getting clustered with its "true" UMI.
+ * That's a real, documented simplification, not a hidden one: directional
+ * adjacency clustering needs a graph over all UMIs sharing a position
+ * (edges = 1-edit-distance neighbors, resolved by count-directionality) to
+ * correctly merge sequencing-error variants, and implementing that
+ * correctly is meaningfully harder than exact matching. Exact-match dedup
+ * still removes true PCR duplicates (identical UMI copied by PCR); it just
+ * won't catch a duplicate whose UMI read had a sequencing error, so it
+ * will somewhat *undercount* how many duplicates there are relative to
+ * UMI-tools' default settings. */
+typedef struct { int chrom_idx; long pos; char strand; char umi[MAX_UMI_LEN + 1]; int read_idx; } DedupKey;
+
+static int dedup_key_cmp(const void *a, const void *b) {
+    const DedupKey *ka = (const DedupKey *)a, *kb = (const DedupKey *)b;
+    if (ka->chrom_idx != kb->chrom_idx) return ka->chrom_idx - kb->chrom_idx;
+    if (ka->pos != kb->pos) return (ka->pos < kb->pos) ? -1 : 1;
+    if (ka->strand != kb->strand) return (unsigned char)ka->strand - (unsigned char)kb->strand;
+    return strcmp(ka->umi, kb->umi);
+}
+
+static long n_duplicate_units = 0;
+static int global_umi_len_used = 0; /* set from main()'s --umi-len flag; read by write_summary()
+                                        so the report can say whether/how UMI dedup ran without
+                                        threading an extra parameter through every writer call. */
+
+static void umi_dedup(int umi_len) {
+    if (umi_len <= 0) return;
+    int step = paired_mode ? 2 : 1;
+    int n_units = n_reads / step;
+
+    DedupKey *keys = xmalloc(sizeof(DedupKey) * (size_t)n_units);
+    int n_keys = 0;
+    for (int u = 0; u < n_units; u++) {
+        Read *r = paired_mode ? &reads[2*u] : &reads[u]; /* representative = R1 (or the SE read) */
+        if (!r->aln.mapped || r->aln.n_hits == 0 || r->umi[0] == '\0') continue;
+        Hit *h = &r->aln.hits[0]; /* primary/first-reported hit's position anchors the dedup key,
+                                      same convention real UMI-aware dedup tools use */
+        keys[n_keys].chrom_idx = h->chrom_idx;
+        keys[n_keys].pos = h->ref_start;
+        keys[n_keys].strand = h->strand;
+        strncpy(keys[n_keys].umi, r->umi, MAX_UMI_LEN); keys[n_keys].umi[MAX_UMI_LEN] = '\0';
+        keys[n_keys].read_idx = paired_mode ? 2*u : u;
+        n_keys++;
+    }
+    qsort(keys, (size_t)n_keys, sizeof(DedupKey), dedup_key_cmp);
+
+    long dup_count = 0;
+    for (int i = 1; i < n_keys; i++) {
+        if (dedup_key_cmp(&keys[i], &keys[i-1]) == 0) {
+            int idx = keys[i].read_idx;
+            reads[idx].aln.is_duplicate = 1;
+            if (paired_mode) reads[idx + 1].aln.is_duplicate = 1;
+            dup_count++;
+        }
+    }
+    n_duplicate_units = dup_count;
+    free(keys);
+}
+
 static void quantify_em(void) {
     int step = paired_mode ? 2 : 1;
     int n_units = n_reads / step;
@@ -1549,19 +1843,47 @@ static void quantify_em(void) {
     int n_multi = 0;
 
     n_unique_units = n_multi_units = n_no_feature_units = n_unmapped_units = 0;
+    /* Strandedness diagnostic (RSeQC infer_experiment.py-style): among
+     * fragments/reads unambiguously assigned to exactly one gene, compare
+     * the alignment strand of read 1 (or the read itself, single-end) to
+     * that gene's annotated strand. A library prepped with a
+     * strand-specific kit (the large majority of modern short-read RNA-seq)
+     * will show a strong majority one way or the other; a conventional
+     * (unstranded) library will land close to 50/50. This is diagnostic
+     * only -- gene assignment above intentionally stays strand-agnostic, so
+     * this doesn't change any count, it just tells you what protocol you
+     * likely have and (see printed guidance) how to interpret/re-run
+     * accordingly if you need strand-aware counting for an antisense-heavy
+     * region of the genome. */
+    long n_dup_units_excluded = 0;
+    long strand_concordant = 0, strand_discordant = 0;
     for (int u = 0; u < n_units; u++) {
+        Read *rep = paired_mode ? &reads[2*u] : &reads[u];
+        if (rep->aln.is_duplicate) { n_dup_units_excluded++; continue; } /* UMI-marked PCR/optical
+                                        duplicate: excluded from counting entirely (not tallied as
+                                        unmapped/no-feature/unique/multi), tracked separately in
+                                        n_duplicate_units below and reported in the QC summary. */
         if (!unit_mapped[u]) { n_unmapped_units++; continue; }
         if (unit_cand[u].n == 0) { n_no_feature_units++; continue; }
         if (unit_cand[u].n == 1) {
             unique_count[unit_cand[u].idx[0]] += 1.0;
             gene_in_use[unit_cand[u].idx[0]] = 1;
             n_unique_units++;
+
+            Read *sense_read = paired_mode ? &reads[2*u] : &reads[u]; /* read 1 (or SE read) */
+            if (sense_read->aln.mapped && sense_read->aln.n_hits > 0) {
+                char rstrand = sense_read->aln.hits[0].strand;
+                char gstrand = genes[unit_cand[u].idx[0]].strand;
+                if (rstrand == gstrand) strand_concordant++; else strand_discordant++;
+            }
         } else {
             for (int i = 0; i < unit_cand[u].n; i++) gene_in_use[unit_cand[u].idx[i]] = 1;
             multi_units[n_multi++] = u;
             n_multi_units++;
         }
     }
+    last_strand_concordant = strand_concordant;
+    last_strand_discordant = strand_discordant;
 
     double *theta = xmalloc(sizeof(double) * (size_t)n_genes);
     double *new_theta = xmalloc(sizeof(double) * (size_t)n_genes);
@@ -1623,6 +1945,7 @@ static void quantify_em(void) {
         }
     }
     for (int g = 0; g < n_genes; g++) genes[g].unique_count = (long)llround(unique_count[g]);
+    n_duplicate_units = n_dup_units_excluded;
 
     free(unit_cand); free(unit_mapped); free(unique_count); free(gene_in_use);
     free(multi_units); free(theta); free(new_theta);
@@ -1680,6 +2003,7 @@ static void write_sam_record_se(FILE *f, const Read *r) {
         const Hit *h = &r->aln.hits[i];
         int flag = (h->strand == '-') ? 0x10 : 0;
         if (i > 0) flag |= 0x100; /* secondary alignment */
+        if (r->aln.is_duplicate) flag |= 0x400;
         char cigar[256];
         format_cigar(h, cigar, sizeof(cigar));
         fprintf(f, "%s\t%d\t%s\t%ld\t%d\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\tNH:i:%d\tXG:Z:%s%s\n",
@@ -1701,6 +2025,7 @@ static void write_sam_record_pe(FILE *f, const Read *r, const Read *mate) {
     if (is_proper_pair(r, mate)) flag |= 0x2;
     if (!mate->aln.mapped) flag |= 0x8;
     else if (mate->aln.hits[0].strand == '-') flag |= 0x20;
+    if (r->aln.is_duplicate) flag |= 0x400;
 
     if (!r->aln.mapped) {
         flag |= 0x4;
@@ -1748,6 +2073,164 @@ static void write_sam(const char *outdir) {
         else write_sam_record_pe(f, r, &reads[r->mate_idx]);
     }
     fclose(f);
+}
+
+/* nf-core/rnaseq (like essentially every real RNA-seq pipeline) doesn't
+ * reimplement BAM sorting/indexing itself -- it shells out to `samtools
+ * sort`/`samtools index`, because that's the correct, battle-tested tool
+ * for the job. This does the same: if `samtools` is on PATH, coordinate-sort
+ * and index the SAM this run just produced into a real, standard
+ * .sorted.bam + .bai pair. If samtools isn't available, this is skipped
+ * with a clear message rather than failing the run -- the pipeline itself
+ * still has no *build*-time dependency beyond libc/libm; this is an
+ * optional runtime convenience when samtools happens to be present. */
+static void try_write_sorted_bam(const char *outdir) {
+    if (system("command -v samtools > /dev/null 2>&1") != 0) {
+        printf("      note: samtools not found on PATH -- skipping sorted/indexed BAM output\n");
+        printf("            (alignments.sam is still written; install samtools and re-run\n");
+        printf("             `samtools sort -o alignments.sorted.bam alignments.sam && samtools index alignments.sorted.bam`\n");
+        printf("             yourself to get one)\n");
+        return;
+    }
+    char sam_path[1040], bam_path[1040], cmd[2200];
+    snprintf(sam_path, sizeof(sam_path), "%s/alignments.sam", outdir);
+    snprintf(bam_path, sizeof(bam_path), "%s/alignments.sorted.bam", outdir);
+    /* -m 256M -@ 1: deliberately conservative. samtools sort's default
+     * per-thread memory (768M) stacks on top of whatever this pipeline's
+     * own process is still holding resident (k-mer index + reads[] array)
+     * at this point in the run -- on a memory-constrained box that
+     * combination OOM-killed the whole run during production validation
+     * (found on a 4GB sandbox running the full 1M-read-pair S. cerevisiae
+     * set). 256M/1 thread trades sort speed for not taking down the run;
+     * raise both if you know you have RAM to spare. */
+    snprintf(cmd, sizeof(cmd), "samtools sort -m 256M -@ 1 -o '%s' '%s' 2>&1 && samtools index '%s' 2>&1",
+             bam_path, sam_path, bam_path);
+    printf("      sorting + indexing BAM via samtools...\n");
+    int rc = system(cmd);
+    if (rc == 0) {
+        printf("      -> wrote %s (+ .bai index)\n", bam_path);
+    } else {
+        printf("      WARNING: samtools sort/index failed (exit %d) -- alignments.sam is still valid,\n", rc);
+        printf("               sorted/indexed BAM was not produced this run\n");
+    }
+}
+
+/* Embedded as a string and written to a temp .py file at run time rather
+ * than shipped as a second file, so the "single C file" property of this
+ * repo still holds -- the only thing that changes is what gets shelled out
+ * to, same as the samtools step above. Converts a bedGraph (from `bedtools
+ * genomecov`) into a real, standard bigWig file via pyBigWig, which writes
+ * the actual UCSC binary bigWig format (R-tree index, zoom levels, the
+ * works) -- this is not a bedGraph renamed with a .bw extension. */
+static const char *BG2BW_PY =
+"import sys, pyBigWig\n"
+"bg_path, chrom_sizes_path, bw_path = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+"chroms = []\n"
+"with open(chrom_sizes_path) as f:\n"
+"    for line in f:\n"
+"        name, size = line.split()\n"
+"        chroms.append((name, int(size)))\n"
+"bw = pyBigWig.open(bw_path, 'w')\n"
+"bw.addHeader(chroms)\n"
+"cur_chrom = None\n"
+"starts, ends, vals = [], [], []\n"
+"def flush():\n"
+"    global starts, ends, vals\n"
+"    if starts:\n"
+"        bw.addEntries([cur_chrom]*len(starts), starts, ends=ends, values=vals)\n"
+"    starts, ends, vals = [], [], []\n"
+"with open(bg_path) as f:\n"
+"    for line in f:\n"
+"        chrom, start, end, val = line.split()\n"
+"        if chrom != cur_chrom:\n"
+"            flush()\n"
+"            cur_chrom = chrom\n"
+"        starts.append(int(start)); ends.append(int(end)); vals.append(float(val))\n"
+"        if len(starts) >= 100000:\n"
+"            flush()\n"
+"flush()\n"
+"bw.close()\n";
+
+/* nf-core/rnaseq produces bigWig coverage tracks via `bedtools genomecov` +
+ * `bedGraphToBigWig` (a UCSC tool). This does the equivalent, substituting
+ * pyBigWig (a widely-packaged Python binding to the same underlying
+ * libBigWig C library UCSC's own tool uses) for the bedGraph->bigWig
+ * conversion step, since that's what's reliably apt-installable rather
+ * than the UCSC binary specifically. Requires `bedtools` on PATH and a
+ * `python3` with `pyBigWig` importable; skips gracefully (leaving the
+ * plain bedGraph, which IGV/UCSC can already load directly) if either is
+ * missing. Only attempted if the sorted BAM step above actually produced
+ * a BAM to read coverage from. */
+static void try_write_bigwig(const char *outdir) {
+    char bam_path[1040];
+    snprintf(bam_path, sizeof(bam_path), "%s/alignments.sorted.bam", outdir);
+    FILE *chk = fopen(bam_path, "rb");
+    if (!chk) {
+        printf("      note: no sorted BAM available -- skipping coverage track (bigWig/bedGraph)\n");
+        return;
+    }
+    fclose(chk);
+
+    if (system("command -v bedtools > /dev/null 2>&1") != 0) {
+        printf("      note: bedtools not found on PATH -- skipping coverage track (bigWig/bedGraph)\n");
+        return;
+    }
+
+    char bg_path[1040], cmd[2200];
+    snprintf(bg_path, sizeof(bg_path), "%s/coverage.bedgraph", outdir);
+    snprintf(cmd, sizeof(cmd), "bedtools genomecov -bga -ibam '%s' > '%s' 2>%s/.genomecov.err",
+             bam_path, bg_path, outdir);
+    printf("      computing genome coverage (bedtools genomecov)...\n");
+    if (system(cmd) != 0) {
+        printf("      WARNING: bedtools genomecov failed -- no coverage track produced this run\n");
+        return;
+    }
+    printf("      -> wrote %s\n", bg_path);
+
+    if (system("python3 -c 'import pyBigWig' > /dev/null 2>&1") != 0) {
+        printf("      note: python3 pyBigWig not available -- leaving coverage as bedGraph\n");
+        printf("            (still directly loadable in IGV/UCSC Genome Browser; install\n");
+        printf("             pyBigWig, or run `bedGraphToBigWig` yourself, for a .bw)\n");
+        return;
+    }
+
+    /* chrom.sizes: written directly from the in-memory chroms[] table --
+     * no need to shell out or re-parse a BAM header for data we already
+     * have. */
+    char sizes_path[1040];
+    snprintf(sizes_path, sizeof(sizes_path), "%s/chrom.sizes", outdir);
+    FILE *sf = fopen(sizes_path, "w");
+    if (!sf) { printf("      WARNING: cannot write chrom.sizes -- leaving coverage as bedGraph\n"); return; }
+    for (int i = 0; i < n_chroms; i++) fprintf(sf, "%s\t%ld\n", chroms[i].name, chroms[i].len);
+    fclose(sf);
+
+    char py_path[1040];
+    snprintf(py_path, sizeof(py_path), "%s/.bg2bw_tmp.py", outdir);
+    FILE *pf = fopen(py_path, "w");
+    if (!pf) { printf("      WARNING: cannot write conversion script -- leaving coverage as bedGraph\n"); return; }
+    fputs(BG2BW_PY, pf);
+    fclose(pf);
+
+    char bw_path[1040];
+    snprintf(bw_path, sizeof(bw_path), "%s/coverage.bw", outdir);
+    snprintf(cmd, sizeof(cmd), "python3 '%s' '%s' '%s' '%s' 2>%s/.bg2bw.err",
+             py_path, bg_path, sizes_path, bw_path, outdir);
+    printf("      converting bedGraph -> bigWig (pyBigWig)...\n");
+    int rc = system(cmd);
+    remove(py_path);
+    if (rc == 0) {
+        printf("      -> wrote %s\n", bw_path);
+    } else {
+        printf("      WARNING: bedGraph->bigWig conversion failed -- leaving coverage as bedGraph\n");
+    }
+    /* Clean up empty stderr capture files from the shell-outs above so a
+     * successful run doesn't leave clutter in outdir. */
+    char err1[1072], err2[1072];
+    snprintf(err1, sizeof(err1), "%s/.genomecov.err", outdir);
+    snprintf(err2, sizeof(err2), "%s/.bg2bw.err", outdir);
+    struct stat st;
+    if (stat(err1, &st) == 0 && st.st_size == 0) remove(err1);
+    if (stat(err2, &st) == 0 && st.st_size == 0) remove(err2);
 }
 
 static void write_gene_counts(const char *outdir) {
@@ -2140,6 +2623,44 @@ static void write_summary(const char *outdir, const char *ref_path, const char *
     if (paired_mode)
         fprintf(f, "  Proper pairs (FR, same chrom): %ld (%.1f%% of pairs)\n", n_proper_pairs, n_units ? 100.0 * n_proper_pairs / n_units : 0.0);
     fprintf(f, "\n");
+
+    {
+        char msg[160];
+        const char *verdict = classify_strandedness(last_strand_concordant, last_strand_discordant, msg, sizeof(msg));
+        fprintf(f, "Strandedness (diagnostic only -- gene assignment above is strand-agnostic)\n");
+        fprintf(f, "  Inferred protocol : %s\n", verdict);
+        fprintf(f, "  Basis             : %s\n", msg);
+        fprintf(f, "  (%ld concordant, %ld discordant, of %ld uniquely-assigned %s used for this check)\n\n",
+                last_strand_concordant, last_strand_discordant, last_strand_concordant + last_strand_discordant,
+                paired_mode ? "fragments" : "reads");
+    }
+
+    if (n_duplicate_units > 0 || global_umi_len_used > 0) {
+        fprintf(f, "UMI-aware deduplication (--umi-len %d, exact chrom+pos+strand+UMI match)\n", global_umi_len_used);
+        fprintf(f, "  %s marked duplicate    : %ld (excluded from gene counts; still in\n",
+                paired_mode ? "Fragments" : "Reads", n_duplicate_units);
+        fprintf(f, "                              alignments.sam/.bam with SAM flag 0x400 set)\n\n");
+    }
+
+    {
+        BiotypeBreakdown b = compute_biotype_breakdown();
+        fprintf(f, "RNA biotype content (rRNA-screening-equivalent QC, from GTF gene_biotype)\n");
+        if (b.total <= 0 || (b.rrna == 0 && b.trna == 0 && b.protein_coding == 0 && b.other == 0)) {
+            fprintf(f, "  GTF has no gene_biotype attribute (or biotype-tagged genes got zero reads) --\n");
+            fprintf(f, "  skipping. Re-generate your GTF with convert_gff3_to_gtf.py (or add\n");
+            fprintf(f, "  gene_biotype \"...\"; yourself) to get this breakdown.\n\n");
+        } else {
+            fprintf(f, "  rRNA             : %10.1f effective reads (%.2f%% of assigned)\n", b.rrna, 100.0 * b.rrna / b.total);
+            fprintf(f, "  tRNA             : %10.1f effective reads (%.2f%% of assigned)\n", b.trna, 100.0 * b.trna / b.total);
+            fprintf(f, "  protein_coding   : %10.1f effective reads (%.2f%% of assigned)\n", b.protein_coding, 100.0 * b.protein_coding / b.total);
+            fprintf(f, "  other biotypes   : %10.1f effective reads (%.2f%% of assigned)\n", b.other, 100.0 * b.other / b.total);
+            if (b.unknown > 0) fprintf(f, "  unknown biotype  : %10.1f effective reads (%.2f%% of assigned)\n", b.unknown, 100.0 * b.unknown / b.total);
+            if (b.total > 0 && 100.0 * b.rrna / b.total > 20.0)
+                fprintf(f, "  NOTE: >20%% rRNA is high for a typical polyA-selected or rRNA-depleted\n"
+                            "        library and may indicate incomplete rRNA depletion during prep.\n");
+            fprintf(f, "\n");
+        }
+    }
 
     fprintf(f, "Gene-level quantification (EM, RSEM/Salmon-style)\n");
     fprintf(f, "  %s uniquely assigned  : %ld\n", paired_mode ? "Fragments" : "Reads", n_unique_units);
@@ -3493,7 +4014,27 @@ static void usage(const char *prog) {
         prog, prog, prog);
 }
 
+/* Scans argv for an optional "--umi-len N" pair anywhere among the
+ * arguments, removes it (shifting everything after it left by two slots)
+ * so the rest of main()'s positional parsing is unaffected by where the
+ * flag was placed, and returns N (0 if the flag wasn't present, meaning
+ * UMI handling is off -- the default, fully backward-compatible). */
+static int extract_umi_len_flag(int *argc_ptr, char **argv) {
+    int argc = *argc_ptr;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--umi-len") == 0) {
+            int umi_len = atoi(argv[i + 1]);
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            *argc_ptr = argc - 2;
+            return umi_len;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    int umi_len = extract_umi_len_flag(&argc, argv);
+    global_umi_len_used = umi_len;
     if (argc >= 2 && strcmp(argv[1], "compare") == 0) return run_compare_mode(argc, argv);
     if (argc < 6) { usage(argv[0]); return 1; }
 
@@ -3533,6 +4074,10 @@ int main(int argc, char **argv) {
     printf("[4/7] Loading reads (%s mode): %s\n", paired_mode ? "paired-end" : "single-end", reads_desc);
     if (paired_mode) load_fastq_pe(argv[4], argv[5]); else load_fastq_se(argv[4]);
     printf("      -> %d read(s) loaded\n", n_reads);
+    if (umi_len > 0) {
+        printf("      extracting %d bp UMI from read1 5' end (--umi-len %d)\n", umi_len, umi_len);
+        extract_umis(umi_len);
+    }
 
     printf("[5/7] Running QC + adapter/quality trimming\n");
     #pragma omp parallel for schedule(dynamic, 256)
@@ -3541,6 +4086,10 @@ int main(int argc, char **argv) {
     printf("[6/7] Aligning reads (k-mer seed + ungapped/spliced extension, multi-mapping-aware)\n");
     #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < n_reads; i++) align_read(&reads[i]);
+    if (umi_len > 0) {
+        umi_dedup(umi_len);
+        printf("      UMI dedup: %ld duplicate unit(s) marked (exact chrom+pos+strand+UMI match)\n", n_duplicate_units);
+    }
     if (paired_mode) {
         long proper_local = 0;
         #pragma omp parallel for schedule(dynamic, 256) reduction(+:proper_local)
@@ -3552,11 +4101,18 @@ int main(int argc, char **argv) {
     printf("[7/7] EM quantification + writing output files to: %s\n", outdir);
     quantify_em();
     write_sam(outdir);
+    try_write_sorted_bam(outdir);
+    try_write_bigwig(outdir);
     write_gene_counts(outdir);
     write_qc_report(outdir);
     write_summary(outdir, ref_path, gtf_path, reads_desc);
     write_html_report(outdir, reads_desc);
 
     printf("Done. (EM converged in %d iterations)\n", em_iterations_run);
+    {
+        char msg[160];
+        const char *verdict = classify_strandedness(last_strand_concordant, last_strand_discordant, msg, sizeof(msg));
+        printf("Inferred library strandedness: %s (%s)\n", verdict, msg);
+    }
     return 0;
 }

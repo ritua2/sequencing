@@ -86,7 +86,7 @@ Then, run the code as follows (similar to the command for the serial run):
 time ./rnaseq_pipeline_omp RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
 ```
 
-**Multi-sample comparison** (PCA, clustering, and — with condition labels — differential expression), run *after* each sample has its own single-sample output directory:
+**Multi-sample comparison** (PCA, clustering, and - with condition labels - differential expression), run *after* each sample has its own single-sample output directory:
 
 ```bash
 # QC/clustering only
@@ -117,3 +117,6 @@ Outputs land in `outdir/`: `alignments.sam`, `gene_counts.tsv`, `qc_report.txt`,
 ## 5. About that `.kidx` file
 
 The first run against a given genome builds the k-mer index and writes `genome.fa.kidx` next to it — that step is the slow part. Every subsequent run against the **same, unmodified** `genome.fa` will load from that cache instead of rebuilding, which is dramatically faster. If you ever replace `genome.fa` with different content but keep the same filename, the pipeline checks file size + modification time and rebuilds automatically — you don't need to delete the cache manually.
+
+Acknowledgement: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.
+

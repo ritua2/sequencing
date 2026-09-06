@@ -86,6 +86,19 @@ Then, run the code as follows (similar to the command for the serial run):
 time ./rnaseq_pipeline_omp RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
 ```
 
+**Multi-sample comparison** (PCA, clustering, and — with condition labels — differential expression), run *after* each sample has its own single-sample output directory:
+
+```bash
+# QC/clustering only
+./rnaseq_pipeline compare out_rep1 out_rep2 out_rep3 combined_outdir/
+
+# With a 2-condition design (needs >=2 replicates per condition) to also run the DESeq2-equivalent differential expression test
+./rnaseq_pipeline compare \
+  out_ctrl1:control out_ctrl2:control \
+  out_trt1:treated  out_trt2:treated \
+  combined_outdir/
+```
+
 ## 4. What you will see
 
 ```

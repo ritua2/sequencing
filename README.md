@@ -6,7 +6,7 @@ Here's how to build and run the code in this repo:
 gcc -O2 -o rnaseq_pipeline rnaseq_pipeline.c -lm
 ```
 
-Or with OpenMP for multi-core parallelism (worth using if your machine has more than 1 core — but the QC/trim and alignment loops are both parallelized):
+Or with OpenMP for multi-core parallelism (worth using if your machine has more than 1 core - but the QC/trim and alignment loops are both parallelized):
 
 ```bash
 gcc -O2 -fopenmp -o rnaseq_pipeline rnaseq_pipeline.c -lm
@@ -14,7 +14,7 @@ gcc -O2 -fopenmp -o rnaseq_pipeline rnaseq_pipeline.c -lm
 
 ## 2. Annotation format — one thing to watch for
 
-The pipeline expects **GTF**, not GFF3. The gene id and gene location information is in the GFF3 file, so it has to be converted before testing. If you are working from the same Ensembl-style GFF3, you'll need to do the same — a minimal gene-level conversion:
+The pipeline expects **GTF**, not GFF3. The gene id and gene location information is in the GFF3 file, so it has to be converted before testing. If you are working from the same Ensembl-style GFF3, you'll need to do the same - a minimal gene-level conversion:
 
 ```bash
 python3 -c "
@@ -116,7 +116,7 @@ Outputs land in `outdir/`: `alignments.sam`, `gene_counts.tsv`, `qc_report.txt`,
 
 ## 5. About that `.kidx` file
 
-The first run against a given genome builds the k-mer index and writes `genome.fa.kidx` next to it — that step is the slow part. Every subsequent run against the **same, unmodified** `genome.fa` will load from that cache instead of rebuilding, which is dramatically faster. If you ever replace `genome.fa` with different content but keep the same filename, the pipeline checks file size + modification time and rebuilds automatically — you don't need to delete the cache manually.
+The first run against a given genome builds the k-mer index and writes `genome.fa.kidx` next to it - that step is the slow part. Every subsequent run against the **same, unmodified** `genome.fa` will load from that cache instead of rebuilding, which is dramatically faster. If you ever replace `genome.fa` with different content but keep the same filename, the pipeline checks file size + modification time and rebuilds automatically - you don't need to delete the cache manually.
 
 Acknowledgement: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.
 

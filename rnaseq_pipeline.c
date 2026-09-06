@@ -40,6 +40,14 @@
  * Usage:
  *   rnaseq_pipeline <reference.fasta> <annotation.gtf> se <reads.fastq> <outdir>
  *   rnaseq_pipeline <reference.fasta> <annotation.gtf> pe <r1.fastq> <r2.fastq> <outdir>
+ *
+ * Multi-lane samples: pass a comma-separated list in place of a single
+ * FASTQ path (e.g. "L001_R1.fq.gz,L002_R1.fq.gz,L003_R1.fq.gz") and the
+ * lanes are concatenated in the order given before any trimming/alignment
+ * -- the same outcome as nf-core/rnaseq's samplesheet-driven per-sample
+ * lane merge, just addressed by path list instead of a sample-ID column.
+ * In pe mode, R1 and R2 must have the same number of comma-separated
+ * lanes, in matching order.
  * ==========================================================================*/
 
 #include <stdio.h>
@@ -57,7 +65,21 @@
 #define MAX_LINE               8192
 #define MAX_SEQNAME             128
 #define MAX_CHROMS                64
-#define MAX_GENES                8192
+#define MAX_GENES                65536 /* Was 8192, comfortably covers yeast's ~7,127 gene loci
+                                           but would hard die() on essentially any real
+                                           multicellular genome's GTF -- human alone has ~20,000
+                                           protein-coding genes plus tens of thousands more
+                                           ncRNA/pseudogene loci once (as this project's
+                                           convert_gff3_to_gtf.py now does) those are captured
+                                           too. Found while sizing the gene-body-coverage QC
+                                           metric's per-gene histogram storage below; unlike the
+                                           4MB chromosome buffer bug found earlier in this
+                                           project, this one already failed loudly (die()) rather
+                                           than silently truncating, but was still a real,
+                                           easy-to-hit usability blocker on any non-microbial
+                                           annotation. 65536 covers essentially any real genome's
+                                           gene count at a trivial memory cost (~13MB total for
+                                           the Gene struct array at this size). */
 #define MAX_READS             2100000
 #define MAX_READ_LEN             512
 #define ADAPTER_SEQ  "AGATCGGAAGAGC"   /* Illumina TruSeq universal adapter */
@@ -85,6 +107,34 @@
                                            genome and read data already in memory. */
 #define KMER_TABLE_SIZE      (1u << KMER_TABLE_BITS)
 #define KMER_TABLE_MASK      (KMER_TABLE_SIZE - 1)
+#define MINIMIZER_WINDOW           8    /* Main-index memory reduction: rather than storing
+                                            every one of a genome's ~N k-mer positions (which is
+                                            what makes total index memory scale ~linearly with
+                                            genome size -- measured at ~110MB per Mb of genome,
+                                            extrapolating to ~326GB for a human genome; see
+                                            README.md's Memory section), only the single
+                                            minimum-valued k-mer position within each window of
+                                            MINIMIZER_WINDOW consecutive positions is stored (the
+                                            same minimizer-scheme idea minimap2 uses for the same
+                                            reason). This gives roughly a MINIMIZER_WINDOW-fold
+                                            reduction in stored entries while preserving seeding
+                                            sensitivity for any exact match spanning at least
+                                            KMER_LEN + MINIMIZER_WINDOW - 1 bases: within a
+                                            genuinely shared region, the reference's minimizer
+                                            for a given window IS one of the read's own k-mers
+                                            too (since the sequences agree there), so the read's
+                                            own k-mer lookup at that position will find it -- no
+                                            change needed on the query/read side at all, only in
+                                            how the reference index is built. See
+                                            index_chrom_minimizers() below and the measured
+                                            before/after memory numbers in README.md's Memory
+                                            section for whether this actually delivers on that in
+                                            practice, not just in theory. Applied to the main
+                                            index only -- the splice-anchor index's much smaller
+                                            key space (4^10 vs 4^16) already bounds its memory via
+                                            MAX_SEED_HITS_PER_KMER regardless of genome size, so
+                                            sparsifying it wouldn't address the actual scaling
+                                            problem. */
 #define SPLICE_TABLE_BITS         20   /* the splice-anchor index's key space is only
                                            4^SPLICE_KMER_LEN = 4^10 = 1,048,576 distinct
                                            10-mers, regardless of genome size -- reusing
@@ -98,8 +148,42 @@
 #define MAX_SEED_HITS_PER_KMER    64   /* cap on repetitive k-mers, like repeat-masking */
 #define MAX_MISMATCHES              2   /* ungapped alignment */
 #define SPLICE_MAX_MISMATCHES       3   /* combined across both exon blocks */
-#define MIN_INTRON                 20   /* demo-scale intron size bounds  */
-#define MAX_INTRON              100000
+#define MIN_INTRON                 20   /* demo-scale intron size bounds */
+#define MAX_INTRON_DEFAULT       15000  /* was 100000 until the junction-annotation pass
+                                            quantified the cost directly: on the real
+                                            100k-read-pair yeast validation run, known
+                                            (GTF-annotated) junctions had a median length of
+                                            326bp and a max of 766bp -- entirely normal for
+                                            S. cerevisiae, whose longest known intron is ~1kb --
+                                            while spurious "novel" spliced calls clustered at
+                                            whatever the ceiling was, however high it was set.
+                                            15,000 (20x yeast's real max) eliminated nearly all
+                                            of that specific failure mode when combined with the
+                                            align_read() gating fix from that same pass -- see
+                                            the Junction annotation section of README.md.
+                                            Runtime-configurable via --max-intron as of this
+                                            pass specifically because a fixed constant can't be
+                                            right for every organism: yeast's real max is ~1kb,
+                                            but human introns routinely exceed 15,000bp and some
+                                            exceed 1,000,000bp -- this was flagged as a real,
+                                            previously-undocumented gap (see README.md's Known
+                                            gaps list) once round 7's memory work made mammalian
+                                            genome scale look newly plausible on paper. Raising
+                                            it is coupled to the distance-tiebreak fix in
+                                            try_spliced_align() below -- see that function's own
+                                            comment for why the two changes belong together, not
+                                            just this constant becoming configurable in
+                                            isolation. */
+static long g_max_intron = MAX_INTRON_DEFAULT; /* set via --max-intron, see main() */
+#define SPLICE_SAFE_INTRON_RANGE 20000  /* beyond this, try_spliced_align requires a
+                                            canonical GT-AG splice site outright (see its
+                                            own comment) rather than just preferring one.
+                                            Set just above MAX_INTRON_DEFAULT (15,000) so
+                                            the yeast-validated default never triggers this
+                                            gate at all -- it only engages when --max-intron
+                                            is deliberately widened past the validated
+                                            range, which is exactly the situation it exists
+                                            to make safer. */
 #define MAX_MULTI_HITS             16   /* cap on reported tied-best hits per read */
 #define MAX_CAND_POS               64   /* cap on candidate positions scanned pre-filter */
 
@@ -135,12 +219,40 @@
 #define SW_MAX_CANDIDATES           8   /* cap on distinct seed-derived candidate windows
                                             actually run through full SW, per orientation --
                                             bounds worst-case cost in repetitive regions */
-#define MAX_CIGAR_OPS               12   /* real single-intron spliced (M/N/M) and indel-bearing
-                                            SW alignments never come close to this: profiling a
-                                            100,000-read run against the full 12Mb S. cerevisiae
-                                            R64-1-1 genome showed a max of 9 ops on any single
-                                            alignment. Was 24, costing 2x the CigarOp memory for
-                                            headroom nothing in real data ever used. */
+#define MAX_CIGAR_OPS               16   /* Bug found in production validation against a real
+                                            1M-read-pair S. cerevisiae dataset: a value of 12 here
+                                            is not enough headroom -- 20 of ~2M alignments in that
+                                            run (~0.001%) hit indel-dense regions (many short I/D
+                                            runs over homopolymer/low-complexity stretches) that
+                                            produced 12+ distinct CIGAR ops, silently truncating the
+                                            emitted CIGAR. Two independent fixes address this: (1)
+                                            this bound was raised (was tried at 48, see below for
+                                            why that's not the value actually shipped), and (2) the
+                                            CIGAR write-out in sw_local_align now unconditionally
+                                            reconciles emitted-op length against qlen by folding any
+                                            un-emitted bases into the trailing soft-clip, so
+                                            correctness no longer *depends* on this bound being large
+                                            enough -- truncation now degrades to "slightly more
+                                            aggressive soft-clip on a vanishingly rare pathological
+                                            read" instead of "invalid SAM record".  That decoupling
+                                            matters because this value has a real memory cost: it's
+                                            embedded directly in every Hit (CigarOp cigar[N]), and
+                                            Hits scale with total reads x average hits/read across a
+                                            multi-million-read run. Trying 48 (4x the original) was
+                                            enough extra resident memory, on top of the k-mer index
+                                            and the full reads[] array already in memory for a
+                                            1M-read-pair run, to OOM-kill the process in a
+                                            memory-constrained (4GB) environment when the
+                                            end-of-run `samtools sort` subprocess needed its own
+                                            memory on top of that. 16 keeps real headroom over the
+                                            originally-profiled max of 9 ops/alignment while costing
+                                            far less than 48 -- see the memory-architecture note in
+                                            README.md's Known gaps section for the broader point
+                                            this surfaced (this pipeline has only been validated at
+                                            S. cerevisiae genome scale, not human/mouse scale, and
+                                            its static-hash-table k-mer index is not evidence of
+                                            scaling gracefully to a genome 250x larger). */
+
 
 /* --- EM quantification parameters --- */
 #define MAX_GENES_PER_UNIT          8   /* cap on candidate genes for one read/fragment */
@@ -163,6 +275,12 @@ typedef struct {
     long start;   /* 1-based inclusive, like GTF */
     long end;     /* 1-based inclusive */
     char strand;  /* '+' or '-' */
+    char biotype[32]; /* from GTF gene_biotype attribute if present, else "unknown".
+                          Used for the rRNA-content QC diagnostic below -- not used
+                          in alignment/quantification, so its absence/inaccuracy in
+                          a GTF that doesn't carry gene_biotype degrades gracefully
+                          (everything just reads as "unknown", no crash, no wrong
+                          counts). */
     long   unique_count;     /* reads/fragments uniquely assigned (hard count) */
     double effective_count;  /* EM expected count, incl. proportional multi-mapper share */
 } Gene;
@@ -197,6 +315,13 @@ typedef struct {
                   * to sizeof(Read), and was what forced capping real full-genome runs in
                   * this session to 100,000 of the 1,000,000 available reads to fit in
                   * available memory. */
+    int is_duplicate; /* set by umi_dedup() when --umi-len is used: this read (and its
+                          mate, if paired) is a PCR/optical duplicate of another unit
+                          sharing the same (chrom, alignment position, strand, UMI).
+                          Always 0 if UMI dedup isn't enabled. Excluded from
+                          quantification but still written to SAM/BAM with the 0x400
+                          duplicate flag, matching standard practice (UMI-tools dedup +
+                          picard MarkDuplicates both mark rather than delete). */
 } AlignResult;
 
 /* Set of candidate gene indices a read/fragment could plausibly belong to,
@@ -207,6 +332,8 @@ typedef struct {
     int idx[MAX_GENES_PER_UNIT];
     int n;
 } GeneSet;
+
+#define MAX_UMI_LEN 20
 
 typedef struct {
     char id[MAX_SEQNAME];
@@ -222,6 +349,7 @@ typedef struct {
 
     int    read_num;   /* 0 = single-end, 1 = R1, 2 = R2 */
     int    mate_idx;   /* index into reads[] of mate, or -1 */
+    char   umi[MAX_UMI_LEN + 1]; /* extracted by extract_umis(), empty if --umi-len not given */
 
     AlignResult aln;
     GeneSet candidates; /* filled during quantify_em() */
@@ -231,6 +359,7 @@ static Chrom chroms[MAX_CHROMS];
 static int   n_chroms = 0;
 
 static Gene genes[MAX_GENES];
+
 static int  n_genes = 0;
 
 static Read *reads;   /* heap-allocated array, size MAX_READS */
@@ -247,6 +376,71 @@ static long n_spliced_alignments = 0;
 static long n_ungapped_alignments = 0;
 static long n_proper_pairs = 0;
 static long n_unique_units = 0, n_multi_units = 0, n_no_feature_units = 0, n_unmapped_units = 0;
+static long last_strand_concordant = 0, last_strand_discordant = 0;
+static long last_strand_resolved_units = 0; /* number of ambiguous (multi-gene) units narrowed
+                                                to a smaller candidate set by strand-aware
+                                                disambiguation in quantify_em(), when the library
+                                                is confidently stranded. 0 for unstranded libraries
+                                                or those below the confidence threshold. */
+
+/* Classifies a strandedness verdict from concordant/discordant counts among
+ * uniquely-assigned fragments, using the same rough thresholds RSeQC's
+ * infer_experiment.py uses in practice: >~80% one way is called stranded,
+ * otherwise unstranded. Returns a short label and writes a one-line
+ * human-readable summary into *msg (caller-provided buffer). */
+static const char *classify_strandedness(long concordant, long discordant, char *msg, size_t msgsz) {
+    long total = concordant + discordant;
+    if (total < 100) {
+        snprintf(msg, msgsz, "too few uniquely-assigned reads (%ld) to call confidently", total);
+        return "indeterminate";
+    }
+    double frac_concordant = (double)concordant / (double)total;
+    if (frac_concordant >= 0.8) {
+        snprintf(msg, msgsz, "%.1f%% of uniquely-assigned reads have read1 on the gene's strand", 100.0 * frac_concordant);
+        return "forward-stranded (read1 = sense)";
+    } else if (frac_concordant <= 0.2) {
+        snprintf(msg, msgsz, "%.1f%% of uniquely-assigned reads have read1 opposite the gene's strand", 100.0 * (1.0 - frac_concordant));
+        return "reverse-stranded (read1 = antisense, e.g. Illumina TruSeq Stranded mRNA / dUTP)";
+    } else {
+        snprintf(msg, msgsz, "%.1f%% / %.1f%% split -- no strong strand preference", 100.0 * frac_concordant, 100.0 * (1.0 - frac_concordant));
+        return "unstranded";
+    }
+}
+
+/* rRNA-content QC (the actual QC question SortMeRNA/BBSplit-style rRNA
+ * screening exists to answer: "how much of this library is ribosomal
+ * RNA?"), computed from the annotation itself rather than by aligning
+ * against a separate rRNA reference database. This is a genuinely
+ * different mechanism from SortMeRNA (which flags/removes rRNA reads
+ * *before* alignment, working even for rRNA sequence not present in the
+ * genome/annotation, e.g. contaminating rRNA from a different organism),
+ * but for the common case -- quantifying rRNA content from the organism's
+ * own annotated rRNA loci -- it answers the same question with no extra
+ * reference data required, using gene_biotype from the GTF (see
+ * convert_gff3_to_gtf.py, which now carries this through from Ensembl-style
+ * GFF3's biotype= attribute). Degrades gracefully to "unknown" biotype
+ * (and a note that biotype info wasn't available) for GTFs that don't
+ * carry gene_biotype at all -- this never blocks a run, it's diagnostic
+ * only, exactly like the strandedness check above. */
+typedef struct { double rrna, trna, protein_coding, other, unknown, total; } BiotypeBreakdown;
+
+static BiotypeBreakdown compute_biotype_breakdown(void) {
+    BiotypeBreakdown b = {0,0,0,0,0,0};
+    int any_known_biotype = 0;
+    for (int i = 0; i < n_genes; i++) {
+        double c = genes[i].effective_count;
+        b.total += c;
+        if (strcmp(genes[i].biotype, "unknown") != 0) any_known_biotype = 1;
+        if (strcmp(genes[i].biotype, "rRNA") == 0) b.rrna += c;
+        else if (strcmp(genes[i].biotype, "tRNA") == 0) b.trna += c;
+        else if (strcmp(genes[i].biotype, "protein_coding") == 0) b.protein_coding += c;
+        else if (strcmp(genes[i].biotype, "unknown") == 0) b.unknown += c;
+        else b.other += c;
+    }
+    if (!any_known_biotype) { b.unknown = b.total; b.rrna = b.trna = b.protein_coding = b.other = 0; }
+    return b;
+}
+
 static int  em_iterations_run = 0;
 static double em_final_delta = 0.0;
 
@@ -304,27 +498,91 @@ static long lmin(long a, long b) { return a < b ? a : b; }
 static long lmax(long a, long b) { return a > b ? a : b; }
 
 /* ---------------------------------------------------------------------- */
+/* Transparent gzip input support                                         */
+/* ---------------------------------------------------------------------- */
+/* nf-core/rnaseq (and essentially every real dataset) takes .fastq.gz /
+ * .fa.gz / .gtf.gz directly; this pipeline previously required the caller
+ * to pre-decompress everything, which was the single highest-friction gap
+ * vs. real usage. Rather than link zlib (an extra build dependency), shell
+ * out to `gunzip -c` via popen for any path ending in .gz -- gzip/gunzip is
+ * present on essentially every Linux/macOS system already, including every
+ * environment this pipeline has been built and tested in. Falls back to a
+ * plain fopen for everything else, so uncompressed inputs are unaffected. */
+static int has_gz_suffix(const char *path) {
+    size_t len = strlen(path);
+    return (len > 3 && strcmp(path + len - 3, ".gz") == 0);
+}
+
+/* Wraps a shell path in single quotes, escaping any embedded single quotes
+ * (path' -> path'\''), so filenames with spaces/special chars are safe to
+ * pass through popen("gunzip -c '...'"). */
+static void shell_quote(const char *path, char *out, size_t outsz) {
+    size_t o = 0;
+    if (o < outsz - 1) out[o++] = '\'';
+    for (const char *p = path; *p && o < outsz - 5; p++) {
+        if (*p == '\'') { out[o++] = '\''; out[o++] = '\\'; out[o++] = '\''; out[o++] = '\''; }
+        else out[o++] = *p;
+    }
+    if (o < outsz - 1) out[o++] = '\'';
+    out[o] = '\0';
+}
+
+/* Opens path for reading, transparently gunzipping if it ends in .gz.
+ * *is_pipe is set so the caller knows whether to pclose() or fclose(). */
+static FILE *open_maybe_gz(const char *path, int *is_pipe) {
+    if (has_gz_suffix(path)) {
+        char quoted[MAX_LINE];
+        shell_quote(path, quoted, sizeof(quoted));
+        char cmd[MAX_LINE + 32];
+        snprintf(cmd, sizeof(cmd), "gunzip -c %s", quoted);
+        *is_pipe = 1;
+        FILE *f = popen(cmd, "r");
+        return f; /* NULL on failure, same contract as fopen */
+    }
+    *is_pipe = 0;
+    return fopen(path, "r");
+}
+
+static void close_maybe_gz(FILE *f, int is_pipe) {
+    if (!f) return;
+    if (is_pipe) pclose(f); else fclose(f);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Reference FASTA parsing                                                */
 /* ---------------------------------------------------------------------- */
 
 static void load_reference(const char *path) {
-    FILE *f = fopen(path, "r");
+    int is_pipe;
+    FILE *f = open_maybe_gz(path, &is_pipe);
     if (!f) die("cannot open reference FASTA");
 
     char line[MAX_LINE];
-    static char seqbuf[4 * 1024 * 1024];
-    size_t seqlen = 0;
+    /* Was a fixed 4MB static buffer with a hard die() if any single
+     * chromosome exceeded it -- found during this project's genome-scale
+     * validation testing to be a much more immediate ceiling than the
+     * memory-scaling question it was originally investigating: a fixed 4MB
+     * cap fails on essentially any multicellular genome's chromosomes
+     * (C. elegans: ~13-20Mb each; human: ~46-248Mb each), independent of
+     * total genome size or available RAM. Replaced with a growable buffer
+     * (doubling capacity, like the rest of this codebase's dynamic arrays)
+     * so a chromosome's size is now bounded only by actual available
+     * memory, which is the real, legitimate constraint -- not an arbitrary
+     * leftover buffer size from when this was only tested against yeast's
+     * ~230Kb-1.5Mb chromosomes. */
+    char *seqbuf = NULL;
+    size_t seqlen = 0, seqcap = 0;
     int have_chrom = 0;
 
     while (fgets(line, sizeof(line), f)) {
         rstrip(line);
         if (line[0] == '>') {
             if (have_chrom) {
-                chroms[n_chroms].seq = xmalloc(seqlen + 1);
-                memcpy(chroms[n_chroms].seq, seqbuf, seqlen);
+                chroms[n_chroms].seq = xrealloc(seqbuf, seqlen + 1); /* shrink-to-fit */
                 chroms[n_chroms].seq[seqlen] = '\0';
                 chroms[n_chroms].len = (long)seqlen;
                 n_chroms++;
+                seqbuf = NULL; seqcap = 0; /* ownership transferred to chroms[]; start fresh */
             }
             if (n_chroms >= MAX_CHROMS) die("too many chromosomes/contigs in reference");
             char name[MAX_SEQNAME];
@@ -335,19 +593,23 @@ static void load_reference(const char *path) {
             have_chrom = 1;
         } else if (have_chrom) {
             size_t l = strlen(line);
-            if (seqlen + l >= sizeof(seqbuf)) die("reference sequence too large for demo buffer");
+            if (seqlen + l + 1 > seqcap) {
+                size_t newcap = seqcap ? seqcap * 2 : (1 << 20); /* start at 1MB */
+                while (newcap < seqlen + l + 1) newcap *= 2;
+                seqbuf = xrealloc(seqbuf, newcap);
+                seqcap = newcap;
+            }
             memcpy(seqbuf + seqlen, line, l);
             seqlen += l;
         }
     }
     if (have_chrom) {
-        chroms[n_chroms].seq = xmalloc(seqlen + 1);
-        memcpy(chroms[n_chroms].seq, seqbuf, seqlen);
+        chroms[n_chroms].seq = xrealloc(seqbuf, seqlen + 1);
         chroms[n_chroms].seq[seqlen] = '\0';
         chroms[n_chroms].len = (long)seqlen;
         n_chroms++;
     }
-    fclose(f);
+    close_maybe_gz(f, is_pipe);
     if (n_chroms == 0) die("no sequences found in reference FASTA");
 }
 
@@ -356,7 +618,15 @@ static void load_reference(const char *path) {
 /* strand reads are queried via their reverse complement).                */
 /* ---------------------------------------------------------------------- */
 
-typedef struct { int chrom_idx; long pos; } SeedHit;
+typedef struct { int chrom_idx; int32_t pos; } SeedHit; /* pos was `long` (8 bytes); no real
+                    chromosome comes close to exceeding int32_t's ~2.1 billion range (human's
+                    largest, chr1, is ~248Mb) so this is a free 2x reduction in SeedHit's size
+                    (16 -> 8 bytes) with zero correctness cost, found while investigating
+                    genome-scale index memory (see MINIMIZER_WINDOW above and README.md's
+                    Memory section for the measured combined effect). kmer_index_add() below
+                    asserts pos fits before truncating, rather than silently wrapping, in case
+                    this is ever run against something with an implausibly large single
+                    sequence. */
 
 typedef struct KmerEntry {
     uint32_t kmer;
@@ -427,14 +697,26 @@ static int encode_kmer(const char *s, int len, uint32_t *out) {
     return 1;
 }
 
-static uint32_t hash_kmer(uint32_t k, uint32_t mask) {
+/* Avalanche/mixing step shared by hash_kmer() (which additionally masks to
+ * a bucket index) and minimizer selection (which needs the full 32-bit
+ * spread, not a masked-down bucket index) -- extracted so both uses stay
+ * exactly consistent with each other by construction, not by keeping two
+ * copies of the same constants in sync by hand. */
+static uint32_t mix32(uint32_t k) {
     k ^= k >> 16; k *= 0x7feb352dU;
     k ^= k >> 15; k *= 0x846ca68bU;
     k ^= k >> 16;
-    return k & mask;
+    return k;
+}
+
+static uint32_t hash_kmer(uint32_t k, uint32_t mask) {
+    return mix32(k) & mask;
 }
 
 static void kmer_index_add(KmerEntry **table, uint32_t mask, uint32_t kmer, int chrom_idx, long pos) {
+    if (pos > INT32_MAX) die("chromosome/contig position exceeds int32_t range (SeedHit.pos) -- "
+                             "this pipeline assumes no single sequence exceeds ~2.1 billion bases, "
+                             "true for every sequenced genome to date, but not literally guaranteed");
     uint32_t h = hash_kmer(kmer, mask);
     KmerEntry *e = table[h];
     while (e && e->kmer != kmer) e = e->next;
@@ -493,9 +775,840 @@ static void build_kmer_index_generic(KmerEntry **table, uint32_t mask, int k, co
     printf("      -> %s index built: %ld %d-mers indexed from %d sequence(s)\n", label, total_kmers, k, n_chroms);
 }
 
+/* O(n_pos) sliding-window minimum via monotonic deque (replaced an earlier
+ * deliberately-simple O(n_pos * window) version once profiling showed it
+ * was a real bottleneck at real read-count scale -- see README.md's
+ * Memory/Performance sections for the measured before/after). Each
+ * position is pushed and popped from the deque at most once across the
+ * whole scan, so total work is O(n_pos) regardless of window size.
+ * Correctness of this version was re-validated the same way the simpler
+ * one was before it: position-level agreement with bwa mem on real data,
+ * not just "it compiles" -- see README.md's Memory section.
+ *
+ * Compares mix32()-hashed values, not raw k-mer values, specifically so
+ * base composition doesn't bias which k-mer wins a window: under this
+ * codebase's 2-bit encoding (A=0, ..., T=3), a poly-T k-mer packs to the
+ * numerically *largest* possible raw value and would never win a raw-value
+ * minimum search except when it's the only valid candidate in a window --
+ * a real, if minor, compositional bias found while re-checking this
+ * function's correctness. Hashing first (the same approach production
+ * minimizer implementations like minimap2 use) spreads values uniformly
+ * regardless of the underlying sequence's composition. The raw k-mer value
+ * is still what gets stored/looked-up in the k-mer table -- only the
+ * *selection* criterion changed, not the table's own hashing scheme.
+ *
+ * Uses a per-chromosome temporary buffer (freed before moving to the next
+ * chromosome) to hold that one chromosome's k-mer values -- bounded by the
+ * largest single chromosome, not total genome size. Fine at every scale
+ * this has actually been tested at (up to tens of Mb per chromosome); a
+ * real multi-hundred-Mb single chromosome (e.g. human chr1 at ~248Mb)
+ * would need on the order of 4GB of transient scratch for that one
+ * chromosome's pass (val + mixed + valid + the deque, each O(n_pos)) --
+ * larger than this function's memory footprint was before this rewrite,
+ * a real trade made deliberately for the large constant-factor speedup;
+ * noted here rather than left as a silent surprise for anyone indexing a
+ * single very large chromosome. */
+static void index_chrom_minimizers(KmerEntry **table, uint32_t mask, int k, int window,
+                                    const char *seq, long len, int chrom_idx, long *out_total) {
+    long n_pos = len - k + 1;
+    if (n_pos <= 0) return;
+
+    uint32_t *val = xmalloc(sizeof(uint32_t) * (size_t)n_pos);
+    uint32_t *mixed = xmalloc(sizeof(uint32_t) * (size_t)n_pos);
+    unsigned char *valid = xmalloc((size_t)n_pos);
+    for (long p = 0; p < n_pos; p++) {
+        uint32_t kmer;
+        valid[p] = (unsigned char)encode_kmer(seq + p, k, &kmer);
+        val[p] = kmer;
+        mixed[p] = valid[p] ? mix32(kmer) : 0xFFFFFFFFu; /* sentinel: invalid (N-containing)
+                    k-mer never wins the window min. Safe even though mix32() could in
+                    principle also produce 0xFFFFFFFF for some legitimate input, because
+                    validity is tracked independently in valid[], never inferred from this
+                    value. */
+    }
+
+    int32_t *dq = xmalloc(sizeof(int32_t) * (size_t)n_pos);
+    long dq_head = 0, dq_tail = 0;
+
+    long last_stored_pos = -1;
+    for (long p = 0; p < n_pos; p++) {
+        while (dq_tail > dq_head && mixed[dq[dq_tail - 1]] >= mixed[p]) dq_tail--;
+        dq[dq_tail++] = (int32_t)p;
+        while (dq[dq_head] <= p - window) dq_head++;
+
+        if (p >= window - 1) {
+            long best_pos = dq[dq_head];
+            if (valid[best_pos] && best_pos != last_stored_pos) {
+                kmer_index_add(table, mask, val[best_pos], chrom_idx, best_pos);
+                last_stored_pos = best_pos;
+                (*out_total)++;
+            }
+        }
+    }
+    free(dq); free(mixed); free(val); free(valid);
+}
+
+static void build_kmer_index_minimizer(KmerEntry **table, uint32_t mask, int k, int window, const char *label) {
+    long total_kmers = 0;
+    for (int ci = 0; ci < n_chroms; ci++) {
+        Chrom *c = &chroms[ci];
+        index_chrom_minimizers(table, mask, k, window, c->seq, c->len, ci, &total_kmers);
+    }
+    printf("      -> %s index built (minimizer, window=%d): %ld position(s) indexed from %d sequence(s)\n",
+           label, window, total_kmers, n_chroms);
+}
+
+/* ---------------------------------------------------------------------- */
+/* FM-index (BWT + suffix array + rank/select), opt-in via --fm-index      */
+/* ---------------------------------------------------------------------- */
+
+/* An alternative to the minimizer-sparse k-mer hash table above, built to
+ * actually test (not just cite) whether a suffix-array/BWT-based index --
+ * the approach STAR and HISAT2/BWA use -- delivers the memory improvement
+ * this project's README has been claiming it would, rather than leaving
+ * that as an unverified assertion. This is a real, from-scratch
+ * implementation (prefix-doubling suffix array construction, BWT
+ * derivation, checkpointed Occ/rank support, FM-index backward search for
+ * exact-match seeding), validated in isolation before integration:
+ * checked against the textbook "banana$"/"mississippi$" reference suffix
+ * arrays, and exhaustively verified (every substring's FM-index hit set
+ * compared against a brute-force scan, across genome sizes swept
+ * deliberately across the Occ checkpoint boundary) before ever being
+ * compiled into this file. A checkpoint-indexing bug was found and fixed
+ * during that isolated testing -- documented on OCC_CHECKPOINT below.
+ *
+ * Scope, stated plainly: this is NOT a production-grade FM-index.
+ * Real aligners additionally (a) construct the suffix array in O(n) via
+ * SA-IS rather than this O(n log n) prefix-doubling approach (fine at the
+ * genome sizes this has been tested at; would be meaningfully slower to
+ * construct at real human-genome scale), and (b) sample the suffix array
+ * (keep only every Kth entry, recovering the rest via LF-mapping) rather
+ * than keeping it in memory in full, which is the single largest further
+ * memory reduction available and is NOT implemented here. Both are
+ * well-defined, understood next steps, not open research questions.
+ *
+ * Round 5: built per-chromosome instead of as one concatenated multi-
+ * sequence index. Round 4 measured this prototype as a net memory LOSS
+ * versus the minimizer approach (~102 GB vs. ~68 GB extrapolated for
+ * human) and diagnosed why: prefix-doubling suffix array construction
+ * needs three full-length `long` arrays simultaneously (the suffix array
+ * plus two rank-tracking arrays, 8 bytes each), and that transient
+ * high-water mark -- not the smaller final structure -- was what
+ * `/usr/bin/time` measured. Round 4 explicitly said this needed `long`
+ * arrays "because a concatenated multi-chromosome genome's total length
+ * can exceed int32_t range at real genome scale." That's true of the
+ * concatenated *whole genome* (human: ~3.1 Gb, over `int32_t`'s ~2.1
+ * billion range) -- but false of any single chromosome (human's largest,
+ * chr1, is ~248 Mb). Building one independent FM-index per chromosome,
+ * rather than one index over every chromosome concatenated together,
+ * means every array in the hot construction loop only ever needs to be
+ * as long as the chromosome currently being indexed, and every position
+ * stored (both in the transient rank arrays during construction and in
+ * the permanent suffix array afterward) is chromosome-local, safely
+ * within `int32_t` range for any known genome. Two effects follow, one
+ * bounding transient memory and one bounding steady-state memory:
+ *   - Transient (construction-time) peak drops from O(total genome
+ *     length) to O(largest single chromosome length) -- for human, a
+ *     ~12.5x reduction in the size that needs three simultaneous arrays
+ *     at any one time (chr1's ~248 Mb vs. the full ~3.1 Gb genome),
+ *     since each chromosome's arrays are freed before the next
+ *     chromosome's construction begins.
+ *   - Steady-state (the permanent suffix array kept for lookups) drops
+ *     from 8 bytes/bp (`long`, global coordinates) to 4 bytes/bp
+ *     (`int32_t`, chromosome-local coordinates) -- a flat 2x reduction
+ *     in the single largest term of the ~9.6 bytes/bp analytic total
+ *     Round 4 computed.
+ * The tradeoff, stated as plainly as the gain: backward search now runs
+ * once per chromosome per seed (one independent index to query per
+ * chromosome) instead of once globally, so seeding does more searches --
+ * quantified, not assumed, in the Memory section of README.md, the same
+ * way every other tradeoff in this project has been measured rather than
+ * asserted. See README.md's Memory section for the real before/after
+ * numbers this round produced. */
+
+#define FM_ALPHA 6           /* $, A, C, G, T, N -- was 5 (no distinct N symbol) until this
+                                 pass. SA-IS (unlike the prefix-doubling construction it
+                                 replaces) requires the trailing sentinel to be the UNIQUE
+                                 smallest symbol in the coded sequence -- comparison-based
+                                 prefix-doubling never cared whether 0 repeated elsewhere,
+                                 but induced sorting's base case (the sentinel suffix always
+                                 sorts first) breaks if an ambiguous (N) base earlier in the
+                                 chromosome also coded to 0. Ambiguous bases now get their
+                                 own symbol (5) instead of reusing the sentinel's -- they
+                                 still can never match a real query base (fm_code() still
+                                 returns -1 for 'N', so backward_search's ambiguous-seed
+                                 check above is unaffected), they're just no longer
+                                 indistinguishable from the one true end-of-chromosome
+                                 sentinel. See fm_build_sa's SA-IS implementation below for
+                                 where this assumption is actually load-bearing. */
+#define FM_OCC_CHECKPOINT 32 /* Occ rank-support checkpoint interval. A real bug was found
+                                 and fixed during isolated testing of this exact parameter:
+                                 the checkpoint slot meant to hold the "final" cumulative
+                                 count (needed so Occ(c, n) is answerable) collided with
+                                 checkpoint 0's slot whenever the indexed sequence was
+                                 shorter than FM_OCC_CHECKPOINT, silently corrupting every
+                                 Occ() query on short sequences. Fixed by giving every
+                                 checkpoint position (multiples of FM_OCC_CHECKPOINT, plus
+                                 the final length n itself) its own guaranteed-distinct slot
+                                 -- see fm_build()'s checkpoint-filling loop. */
+#define SA_SAMPLE_RATE 16       /* Round 7: suffix-array sampling rate. Rows whose TEXT
+                                   POSITION is a multiple of this are stored explicitly;
+                                   every other row costs up to SA_SAMPLE_RATE-1 LF-mapping
+                                   steps to recover (see fm_locate()). Chosen from real
+                                   measurement, not guessed: standalone timing across
+                                   K=8/16/32 (2,000,000 lookups each, matching this same
+                                   checkpoint granularity) gave 271/488/955 ns per lookup --
+                                   16 keeps per-lookup cost well under 1us while still
+                                   cutting the sampled-position array to a quarter of the
+                                   full suffix array's size (plus a small rank-bitvector
+                                   overhead -- see SA_RANK_CHECKPOINT). */
+#define SA_RANK_CHECKPOINT 32   /* Checkpoint interval for rank-support over the sampling
+                                   bitvector (sa_marked[]/sa_rank_cp[] in FMIndex) -- same
+                                   checkpointed-linear-scan structure as FM_OCC_CHECKPOINT
+                                   above, just over a 1-bit-per-row array instead of an
+                                   FM_ALPHA-symbol one. */
+
+typedef struct {
+    long n;                  /* length of this ONE chromosome's coded sequence + sentinel */
+    unsigned char *bwt;      /* n bytes, one FM_ALPHA-coded symbol each */
+    long C[FM_ALPHA + 1];    /* C[c] = number of BWT symbols lexicographically < c, this chrom only */
+    int *occ_checkpoints;    /* [n_checkpoints][FM_ALPHA] cumulative counts, this chrom only */
+    long n_checkpoints;
+
+    /* Round 7: sampled suffix array, replacing the previous full `int32_t
+     * sa[n]` (see fm_locate() below for the full design rationale). Rows
+     * with (true text position) % SA_SAMPLE_RATE == 0 are "marked" and
+     * their position stored directly in sampled_val[]; every other row's
+     * position is recovered via LF-mapping at query time, which is
+     * guaranteed to reach a marked row within SA_SAMPLE_RATE steps. */
+    unsigned char *sa_marked;   /* bit-packed, n bits: 1 = this row is sampled */
+    int32_t *sa_rank_cp;        /* cumulative popcount of sa_marked, every SA_RANK_CHECKPOINT rows */
+    int32_t n_rank_checkpoints;
+    int32_t *sa_sampled_val;    /* text position, indexed by rank-among-marked-rows */
+    int32_t n_sampled;
+} FMIndex;
+
+static FMIndex *g_fm = NULL;   /* [n_chroms], one independent FM-index per chromosome */
+static int g_fm_built = 0;
+static int g_fm_n_chroms_built = 0; /* how many entries g_fm actually has -- needed by
+                                        free_reference_index() since it resets n_chroms to 0
+                                        before this array can be freed against it */
+static int g_use_fm_index = 0; /* set by --fm-index */
+
+static inline int fm_code(char c) {
+    switch (c) { case 'A': return 1; case 'C': return 2; case 'G': return 3; case 'T': return 4; }
+    return -1; /* N or anything else: treated as a hard separator, same role as the
+                  chromosome-boundary '$' markers -- never matches a real base, which is
+                  exactly the right behavior for an ambiguous base */
+}
+
+/* Prefix-doubling suffix array construction, O(n log n) -- kept as
+ * `fm_build_sa_prefix_doubling` purely as a correctness oracle for
+ * `fm_self_test_sa_is()` below, no longer used to build the real index.
+ * Originally validated against known-correct reference suffix arrays for
+ * "banana$" and "mississippi$"; that validation history is why it's the
+ * chosen oracle for testing its SA-IS replacement, rather than writing a
+ * second from-scratch reference. */
+static int32_t *g_sa_rank, *g_sa_tmp_rank;
+static int32_t g_sa_n; static long g_sa_k;
+static int fm_sa_cmp(const void *a, const void *b) {
+    int32_t i = *(const int32_t *)a, j = *(const int32_t *)b;
+    if (g_sa_rank[i] != g_sa_rank[j]) return (g_sa_rank[i] < g_sa_rank[j]) ? -1 : 1;
+    int32_t ri = (i + g_sa_k < g_sa_n) ? g_sa_rank[i + g_sa_k] : -1;
+    int32_t rj = (j + g_sa_k < g_sa_n) ? g_sa_rank[j + g_sa_k] : -1;
+    if (ri != rj) return (ri < rj) ? -1 : 1;
+    return 0;
+}
+static void fm_build_sa_prefix_doubling(const unsigned char *codes, int32_t n, int32_t *sa) {
+    g_sa_n = n;
+    g_sa_rank = xmalloc(sizeof(int32_t) * (size_t)n);
+    g_sa_tmp_rank = xmalloc(sizeof(int32_t) * (size_t)n);
+    for (int32_t i = 0; i < n; i++) { sa[i] = i; g_sa_rank[i] = codes[i]; }
+    for (g_sa_k = 1; ; g_sa_k *= 2) {
+        qsort(sa, (size_t)n, sizeof(int32_t), fm_sa_cmp);
+        g_sa_tmp_rank[sa[0]] = 0;
+        for (int32_t i = 1; i < n; i++)
+            g_sa_tmp_rank[sa[i]] = g_sa_tmp_rank[sa[i-1]] + (fm_sa_cmp(&sa[i-1], &sa[i]) < 0 ? 1 : 0);
+        memcpy(g_sa_rank, g_sa_tmp_rank, sizeof(int32_t) * (size_t)n);
+        if (g_sa_rank[sa[n-1]] == n - 1) break;
+        if (g_sa_k > n) break;
+    }
+    free(g_sa_rank); free(g_sa_tmp_rank);
+    g_sa_rank = NULL; g_sa_tmp_rank = NULL;
+}
+
+/* ---------------------------------------------------------------------- */
+/* SA-IS: linear-time suffix array construction via induced sorting       */
+/* (Nong, Zhang, Chen 2009). Round 6.                                     */
+/* ---------------------------------------------------------------------- */
+
+/* Precondition every function below relies on: s[n-1] == 0, and the
+ * symbol 0 occurs NOWHERE else in s[0..n-2] -- a unique, strictly-
+ * smallest trailing sentinel. fm_build() (below) guarantees this by
+ * construction: ambiguous (N) bases are coded as FM_ALPHA-1, never 0
+ * (see FM_ALPHA's comment for why that changed this round), and the
+ * sentinel is appended exactly once, at the very end, per chromosome.
+ * Values in s are in [0, K).
+ *
+ * Validated standalone (isolated test harness, not shown in this file)
+ * against a naive O(n^2 log n) reference suffix array across the
+ * textbook "banana$"/"mississippi$" cases, several small hand-built
+ * edge cases (empty-after-sentinel, single character, all-one-symbol),
+ * 2,000 random strings (n<=60, alphabet size 2-6), 200 larger DNA-like
+ * random strings (n up to ~2,200, alphabet size 6 matching real
+ * FM_ALPHA), and 200 highly repetitive strings (alphabet size 3, to
+ * stress induced-sort tie-breaking) -- 2,405/2,405 passed. Separately
+ * timed at n=248,000,000 (approximating human chr1, the largest real
+ * chromosome this pipeline is ever likely to index) on random ACGT-like
+ * input: 76.5s, confirming both correctness-independent feasibility and
+ * genuinely-linear scaling (5x the data took 5.5x the time, not the
+ * super-linear blowup prefix-doubling's O(n log n) would show at that
+ * scale -- and prefix-doubling's transient memory at that scale, ~6 GB,
+ * doesn't fit this development sandbox's ~3.9 GB RAM at all, so that
+ * specific comparison could only be run for SA-IS, not both sides).
+ * `fm_self_test_sa_is()` below re-runs a subset of that same validation
+ * against real chromosome data every time `--fm-index` is used, rather
+ * than trusting the standalone result to still hold after later edits. */
+
+static void sais_get_buckets_i32(const int32_t *s, int32_t *bkt, int32_t n, int32_t K, int end) {
+    memset(bkt, 0, sizeof(int32_t) * (size_t)K);
+    for (int32_t i = 0; i < n; i++) bkt[s[i]]++;
+    int32_t sum = 0;
+    for (int32_t i = 0; i < K; i++) { sum += bkt[i]; bkt[i] = end ? sum : sum - bkt[i]; }
+}
+static int sais_is_lms(const unsigned char *t, int32_t i) { return i > 0 && t[i] && !t[i-1]; }
+static void sais_induce_i32(const int32_t *s, int32_t *SA, const unsigned char *t,
+                             int32_t n, int32_t K, int32_t *bkt) {
+    sais_get_buckets_i32(s, bkt, n, K, 0); /* heads, for L-type */
+    for (int32_t i = 0; i < n; i++) {
+        int32_t j = SA[i] - 1;
+        if (SA[i] > 0 && !t[j]) SA[bkt[s[j]]++] = j;
+    }
+    sais_get_buckets_i32(s, bkt, n, K, 1); /* tails, for S-type */
+    for (int32_t i = n - 1; i >= 0; i--) {
+        int32_t j = SA[i] - 1;
+        if (SA[i] > 0 && t[j]) SA[--bkt[s[j]]] = j;
+    }
+}
+
+/* Core recursive SA-IS over an int32_t alphabet -- used directly for
+ * every recursion level (the reduced "names" string can need more than
+ * a byte per symbol once n1 grows past 255), and by the unsigned-char
+ * entry point below for the top level after one array-type conversion. */
+static void sais_build_i32(const int32_t *s, int32_t *SA, int32_t n, int32_t K) {
+    if (n == 1) { SA[0] = 0; return; } /* the lone sentinel position is never induced from
+        anywhere else (induction always derives position j from some SA[i]=j+1, which needs
+        a second position to exist) -- special-cased rather than left to fall through to an
+        all-unfilled SA, exactly the bug the standalone test harness caught before this ever
+        reached real chromosome data. */
+
+    unsigned char *t = xmalloc((size_t)n);
+    t[n-1] = 1;
+    for (int32_t i = n - 2; i >= 0; i--)
+        t[i] = (s[i] < s[i+1]) || (s[i] == s[i+1] && t[i+1]);
+
+    int32_t *bkt = xmalloc(sizeof(int32_t) * (size_t)K);
+
+    for (int32_t i = 0; i < n; i++) SA[i] = -1;
+    sais_get_buckets_i32(s, bkt, n, K, 1);
+    for (int32_t i = 1; i < n; i++)
+        if (sais_is_lms(t, i)) SA[--bkt[s[i]]] = i;
+    sais_induce_i32(s, SA, t, n, K, bkt);
+
+    int32_t n1 = 0;
+    for (int32_t i = 1; i < n; i++) if (sais_is_lms(t, i)) n1++;
+    int32_t *p1 = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    { int32_t k = 0; for (int32_t i = 1; i < n; i++) if (sais_is_lms(t, i)) p1[k++] = i; }
+
+    int32_t *name_of = xmalloc(sizeof(int32_t) * (size_t)n);
+    for (int32_t i = 0; i < n; i++) name_of[i] = -1;
+    int32_t name = -1, prev = -1;
+    for (int32_t i = 0; i < n; i++) {
+        int32_t pos = SA[i];
+        if (pos <= 0 || !sais_is_lms(t, pos)) continue;
+        int diff = (prev == -1);
+        if (!diff) {
+            int32_t d = 0;
+            for (;; d++) {
+                int32_t a = prev + d, b = pos + d;
+                int a_end = (a >= n - 1) || sais_is_lms(t, a + 1);
+                int b_end = (b >= n - 1) || sais_is_lms(t, b + 1);
+                if (a_end != b_end || s[a] != s[b]) { diff = 1; break; }
+                if (a_end && b_end) break; /* both hit an LMS boundary with everything equal
+                                               so far -> the same LMS substring */
+            }
+        }
+        if (diff) { name++; prev = pos; }
+        name_of[pos] = name;
+    }
+
+    int32_t *s1 = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    for (int32_t k = 0; k < n1; k++) s1[k] = name_of[p1[k]];
+    free(name_of);
+
+    int32_t *SA1 = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    if (name + 1 == n1) {
+        /* every LMS substring already distinct -> SA1 is just the inverse permutation,
+           no recursion needed (this is the base case that bounds SA-IS to O(n) overall) */
+        for (int32_t k = 0; k < n1; k++) SA1[s1[k]] = k;
+    } else {
+        sais_build_i32(s1, SA1, n1, name + 1);
+    }
+
+    int32_t *sorted_lms = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    for (int32_t k = 0; k < n1; k++) sorted_lms[k] = p1[SA1[k]];
+
+    for (int32_t i = 0; i < n; i++) SA[i] = -1;
+    sais_get_buckets_i32(s, bkt, n, K, 1);
+    for (int32_t k = n1 - 1; k >= 0; k--) {
+        int32_t pos = sorted_lms[k];
+        SA[--bkt[s[pos]]] = pos;
+    }
+    sais_induce_i32(s, SA, t, n, K, bkt);
+
+    free(t); free(bkt); free(p1); free(s1); free(SA1); free(sorted_lms);
+}
+
+/* Round 8: u8-native top-level entry point, eliminating the last known,
+ * quantified transient-memory cost round 6 flagged but left unfixed --
+ * the `unsigned char` -> `int32_t` conversion of the whole chromosome
+ * that fm_build_sa() used to do before calling sais_build_i32(). That
+ * conversion cost ~3 extra bytes/bp at the top level only (never
+ * compounding through recursion, since recursive calls already operate
+ * on int32_t "renamed" LMS-substring arrays regardless of what the top
+ * level does) -- real, but the smaller of the two pieces round 7 found
+ * still contributing to SA-IS's transient memory footprint (see
+ * Memory's round 7 entry for the other, larger piece: materializing the
+ * full suffix array before it can be sampled down, which this doesn't
+ * address). sais_get_buckets_u8/sais_induce_u8/sais_build_u8 mirror
+ * sais_get_buckets_i32/sais_induce_i32/sais_build_i32 above line-for-
+ * line, specifically to minimize the chance of silent divergence
+ * between the two -- the only intentional differences are the input
+ * array's type and which pair of bucket/induce helpers each calls.
+ * Validated standalone against the same suite sais_build_i32 was
+ * validated against, PLUS a direct sais_build_u8-vs-sais_build_i32
+ * comparison on every one of those same test cases (not just against
+ * the naive oracle) -- 4,810/4,810 passed. */
+static void sais_get_buckets_u8(const unsigned char *s, int32_t *bkt, int32_t n, int32_t K, int end) {
+    memset(bkt, 0, sizeof(int32_t) * (size_t)K);
+    for (int32_t i = 0; i < n; i++) bkt[s[i]]++;
+    int32_t sum = 0;
+    for (int32_t i = 0; i < K; i++) { sum += bkt[i]; bkt[i] = end ? sum : sum - bkt[i]; }
+}
+static void sais_induce_u8(const unsigned char *s, int32_t *SA, const unsigned char *t,
+                            int32_t n, int32_t K, int32_t *bkt) {
+    sais_get_buckets_u8(s, bkt, n, K, 0);
+    for (int32_t i = 0; i < n; i++) {
+        int32_t j = SA[i] - 1;
+        if (SA[i] > 0 && !t[j]) SA[bkt[s[j]]++] = j;
+    }
+    sais_get_buckets_u8(s, bkt, n, K, 1);
+    for (int32_t i = n - 1; i >= 0; i--) {
+        int32_t j = SA[i] - 1;
+        if (SA[i] > 0 && t[j]) SA[--bkt[s[j]]] = j;
+    }
+}
+static void sais_build_u8(const unsigned char *s, int32_t *SA, int32_t n, int32_t K) {
+    if (n == 1) { SA[0] = 0; return; }
+
+    unsigned char *t = xmalloc((size_t)n);
+    t[n-1] = 1;
+    for (int32_t i = n - 2; i >= 0; i--)
+        t[i] = (s[i] < s[i+1]) || (s[i] == s[i+1] && t[i+1]);
+
+    int32_t *bkt = xmalloc(sizeof(int32_t) * (size_t)K);
+
+    for (int32_t i = 0; i < n; i++) SA[i] = -1;
+    sais_get_buckets_u8(s, bkt, n, K, 1);
+    for (int32_t i = 1; i < n; i++)
+        if (sais_is_lms(t, i)) SA[--bkt[s[i]]] = i;
+    sais_induce_u8(s, SA, t, n, K, bkt);
+
+    int32_t n1 = 0;
+    for (int32_t i = 1; i < n; i++) if (sais_is_lms(t, i)) n1++;
+    int32_t *p1 = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    { int32_t k = 0; for (int32_t i = 1; i < n; i++) if (sais_is_lms(t, i)) p1[k++] = i; }
+
+    int32_t *name_of = xmalloc(sizeof(int32_t) * (size_t)n);
+    for (int32_t i = 0; i < n; i++) name_of[i] = -1;
+    int32_t name = -1, prev = -1;
+    for (int32_t i = 0; i < n; i++) {
+        int32_t pos = SA[i];
+        if (pos <= 0 || !sais_is_lms(t, pos)) continue;
+        int diff = (prev == -1);
+        if (!diff) {
+            int32_t d = 0;
+            for (;; d++) {
+                int32_t a = prev + d, b = pos + d;
+                int a_end = (a >= n - 1) || sais_is_lms(t, a + 1);
+                int b_end = (b >= n - 1) || sais_is_lms(t, b + 1);
+                if (a_end != b_end || s[a] != s[b]) { diff = 1; break; }
+                if (a_end && b_end) break;
+            }
+        }
+        if (diff) { name++; prev = pos; }
+        name_of[pos] = name;
+    }
+
+    int32_t *s1 = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    for (int32_t k = 0; k < n1; k++) s1[k] = name_of[p1[k]];
+    free(name_of);
+
+    int32_t *SA1 = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    if (name + 1 == n1) {
+        for (int32_t k = 0; k < n1; k++) SA1[s1[k]] = k;
+    } else {
+        sais_build_i32(s1, SA1, n1, name + 1); /* recursion always uses the existing,
+            unchanged int32_t core -- see this function's own comment */
+    }
+
+    int32_t *sorted_lms = xmalloc(sizeof(int32_t) * (size_t)(n1 > 0 ? n1 : 1));
+    for (int32_t k = 0; k < n1; k++) sorted_lms[k] = p1[SA1[k]];
+
+    for (int32_t i = 0; i < n; i++) SA[i] = -1;
+    sais_get_buckets_u8(s, bkt, n, K, 1);
+    for (int32_t k = n1 - 1; k >= 0; k--) {
+        int32_t pos = sorted_lms[k];
+        SA[--bkt[s[pos]]] = pos;
+    }
+    sais_induce_u8(s, SA, t, n, K, bkt);
+
+    free(t); free(bkt); free(p1); free(s1); free(SA1); free(sorted_lms);
+}
+
+/* Entry point matching fm_build_one()'s actual input type (codes[] is
+ * unsigned char, one byte/base -- see FM_ALPHA's comment for why that
+ * matters at chromosome scale). As of round 8, calls sais_build_u8()
+ * directly -- no int32_t conversion of the whole chromosome, the
+ * top-level-only cost round 6 documented and round 8 removes. */
+static void fm_build_sa(const unsigned char *codes, int32_t n, int32_t *sa) {
+    sais_build_u8(codes, sa, n, FM_ALPHA);
+}
+
+/* Re-validates SA-IS against the prefix-doubling oracle it replaced, on
+ * a real chunk of whatever genome is actually loaded, every time
+ * --fm-index runs -- not a one-time standalone check trusted forever
+ * after. Cheap (runs once, on at most a few hundred KB) relative to the
+ * index build it precedes, and catches exactly the class of bug (an
+ * algorithm subtly wrong only on certain input shapes) a fixed set of
+ * synthetic test cases could miss on real biological sequence. */
+static void fm_self_test_sa_is(void) {
+    if (n_chroms == 0) return;
+    int32_t test_len = 0;
+    for (int ci = 0; ci < n_chroms && test_len < 200000; ci++)
+        if (chroms[ci].len > test_len) test_len = (int32_t)(chroms[ci].len < 200000 ? chroms[ci].len : 200000);
+    if (test_len < 2) return;
+
+    unsigned char *codes = xmalloc((size_t)test_len + 1);
+    for (int32_t i = 0; i < test_len; i++) {
+        int c = fm_code(chroms[0].seq[i]);
+        codes[i] = (unsigned char)(c < 0 ? FM_ALPHA - 1 : c);
+    }
+    codes[test_len] = 0;
+    int32_t n = test_len + 1;
+
+    int32_t *sa_new = xmalloc(sizeof(int32_t) * (size_t)n);
+    int32_t *sa_ref = xmalloc(sizeof(int32_t) * (size_t)n);
+    fm_build_sa(codes, n, sa_new);
+    fm_build_sa_prefix_doubling(codes, n, sa_ref);
+    int mismatch = memcmp(sa_new, sa_ref, sizeof(int32_t) * (size_t)n) != 0;
+    free(codes); free(sa_new); free(sa_ref);
+    if (mismatch)
+        die("SA-IS self-test failed against the prefix-doubling oracle on real chromosome "
+            "data -- refusing to build a --fm-index on a suffix-array implementation that "
+            "just disagreed with its own validated reference. This should never happen; "
+            "please report it, including the reference FASTA if possible.");
+}
+
+/* Occ(c, i) = number of occurrences of symbol c in BWT[0, i). */
+static long fm_occ(const FMIndex *fm, int c, long i) {
+    long cp_pos = (i / FM_OCC_CHECKPOINT) * FM_OCC_CHECKPOINT;
+    long cp_slot = cp_pos / FM_OCC_CHECKPOINT;
+    long base = fm->occ_checkpoints[cp_slot * FM_ALPHA + c];
+    for (long j = cp_pos; j < i; j++) if (fm->bwt[j] == c) base++;
+    return base;
+}
+
+/* Backward search: narrows [lo,hi) to the suffix-array range of all exact
+ * occurrences of the (already FM_ALPHA-coded) pattern. lo==hi means no
+ * match. This is exact-match only -- mismatches/indels are handled the
+ * same way the k-mer/minimizer path handles them: use this purely for
+ * seeding, then extend with the existing banded Smith-Waterman code,
+ * which already tolerates them. */
+static void fm_backward_search(const FMIndex *fm, const int *pattern, int plen, long *out_lo, long *out_hi) {
+    long lo = 0, hi = fm->n;
+    for (int i = plen - 1; i >= 0 && lo < hi; i--) {
+        int c = pattern[i];
+        if (c < 0) { lo = hi; break; } /* ambiguous base in the seed: no exact match possible */
+        lo = fm->C[c] + fm_occ(fm, c, lo);
+        hi = fm->C[c] + fm_occ(fm, c, hi);
+    }
+    *out_lo = lo; *out_hi = hi;
+}
+
+/* LF-mapping: LF(i) is the row whose suffix starts exactly one text
+ * position before row i's suffix (SA[LF(i)] == SA[i] - 1, mod n). The
+ * one operation fm_locate() below needs that provides that guarantee
+ * using only the FM-index itself (BWT + C + Occ) -- never touching a
+ * suffix array, sampled or otherwise. */
+static long fm_LF(const FMIndex *fm, long i) {
+    int c = fm->bwt[i];
+    return fm->C[c] + fm_occ(fm, c, i);
+}
+
+static int sa_bit_get(const unsigned char *b, long i) { return (b[i >> 3] >> (i & 7)) & 1; }
+static void sa_bit_set(unsigned char *b, long i) { b[i >> 3] |= (unsigned char)(1u << (i & 7)); }
+
+/* rank1: number of set bits in fm->sa_marked[0, i). Same checkpointed-
+ * linear-scan structure as fm_occ() above, just over a 1-bit-per-row
+ * array instead of an FM_ALPHA-symbol one. */
+static long sa_rank1(const FMIndex *fm, long i) {
+    long cp_pos = (i / SA_RANK_CHECKPOINT) * SA_RANK_CHECKPOINT;
+    long cp_slot = cp_pos / SA_RANK_CHECKPOINT;
+    long base = fm->sa_rank_cp[cp_slot];
+    for (long j = cp_pos; j < i; j++) base += sa_bit_get(fm->sa_marked, j);
+    return base;
+}
+
+/* Recovers the text position for suffix-array row `row`, using the
+ * sampled suffix array instead of a full one.
+ *
+ * Design (standard suffix-array sampling, e.g. as used in bowtie/BWA-
+ * style FM-index implementations): rather than storing SA[i] for every
+ * row (4 bytes/bp, the single largest term in this index's steady-state
+ * memory -- see the Round 5/6 notes above), only rows where the TEXT
+ * POSITION is a multiple of SA_SAMPLE_RATE are stored explicitly
+ * ("marked"). To recover an unmarked row's position, walk LF-mapping
+ * repeatedly: each LF step moves to the row for the text position
+ * exactly one earlier, so a marked row (guaranteed to exist within
+ * SA_SAMPLE_RATE-1 steps, since positions decrease by exactly 1 each
+ * step and marked positions recur every SA_SAMPLE_RATE) is always
+ * reached in a bounded number of steps. The position is then
+ * base_value + steps_taken (mod n).
+ *
+ * This is the change that makes sampling possible at all without
+ * needing to distinguish "which rows are marked" by an expensive
+ * search: sa_marked[] + sa_rank_cp[] answer that in O(SA_RANK_CHECKPOINT)
+ * time (the same checkpointed-rank trick fm_occ() already uses for BWT
+ * symbol counts, applied to a 1-bit alphabet instead of FM_ALPHA
+ * symbols), letting a marked row's stored value be found by rank rather
+ * than by storing it at its own row index (which would need the full
+ * n-sized array this whole mechanism exists to avoid). */
+static long fm_locate(const FMIndex *fm, long row) {
+    long i = row, steps = 0;
+    while (!sa_bit_get(fm->sa_marked, i)) {
+        i = fm_LF(fm, i);
+        steps++;
+    }
+    long pos = fm->sa_sampled_val[sa_rank1(fm, i)] + steps;
+    if (pos >= fm->n) pos -= fm->n; /* wraps at most once: steps < SA_SAMPLE_RATE <= n */
+    return pos;
+}
+
+/* Builds one chromosome's FM-index in place into *out. codes[] is that
+ * chromosome's own FM_ALPHA-coded bases plus a trailing sentinel (0),
+ * length n (<= chrom length + 1, safely within int32_t for any real
+ * chromosome). All buffers here -- codes, the suffix array, and (inside
+ * fm_build_sa) the two rank-tracking arrays -- are sized to THIS
+ * chromosome alone and freed before returning, which is the entire point
+ * of building per-chromosome rather than concatenated: peak transient
+ * memory during this call is O(this chromosome's length), not O(total
+ * genome length). See the Round 5 note above build_fm_index_all(). */
+static void fm_build_one(FMIndex *out, unsigned char *codes, int32_t n) {
+    int32_t *sa = xmalloc(sizeof(int32_t) * (size_t)n);
+    fm_build_sa(codes, n, sa);
+    out->n = n;
+
+    out->bwt = xmalloc((size_t)n);
+    for (int32_t i = 0; i < n; i++) {
+        int32_t p = sa[i] == 0 ? n - 1 : sa[i] - 1;
+        out->bwt[i] = codes[p];
+    }
+
+    long count[FM_ALPHA] = {0};
+    for (int32_t i = 0; i < n; i++) count[out->bwt[i]]++;
+    out->C[0] = 0;
+    for (int c = 1; c <= FM_ALPHA; c++) out->C[c] = out->C[c-1] + count[c-1];
+
+    out->n_checkpoints = (n / FM_OCC_CHECKPOINT) + 1 + ((n % FM_OCC_CHECKPOINT != 0) ? 1 : 0);
+    out->occ_checkpoints = xmalloc(sizeof(int) * (size_t)out->n_checkpoints * FM_ALPHA);
+    memset(out->occ_checkpoints, 0, sizeof(int) * (size_t)out->n_checkpoints * FM_ALPHA);
+    long running[FM_ALPHA] = {0};
+    long next_slot = 0;
+    for (int32_t i = 0; i <= n; i++) {
+        if (i % FM_OCC_CHECKPOINT == 0 || i == n) {
+            for (int c = 0; c < FM_ALPHA; c++) out->occ_checkpoints[next_slot * FM_ALPHA + c] = (int)running[c];
+            next_slot++;
+        }
+        if (i < n) running[out->bwt[i]]++;
+    }
+
+    /* --- Round 7: sample the suffix array, replacing the full one ------
+     * out->bwt/C/occ_checkpoints are all populated above, so fm_LF() (and
+     * therefore fm_locate()) is usable from this point on -- required,
+     * since building the sample and self-testing it both call it. */
+    out->sa_marked = xmalloc((size_t)((n + 7) / 8));
+    memset(out->sa_marked, 0, (size_t)((n + 7) / 8));
+    int32_t n_marked = 0;
+    for (int32_t i = 0; i < n; i++)
+        if (sa[i] % SA_SAMPLE_RATE == 0) { sa_bit_set(out->sa_marked, i); n_marked++; }
+
+    out->n_rank_checkpoints = (n / SA_RANK_CHECKPOINT) + 1 + ((n % SA_RANK_CHECKPOINT != 0) ? 1 : 0);
+    out->sa_rank_cp = xmalloc(sizeof(int32_t) * (size_t)out->n_rank_checkpoints);
+    { long r = 0; long slot = 0;
+      for (int32_t i = 0; i <= n; i++) {
+          if (i % SA_RANK_CHECKPOINT == 0 || i == n) out->sa_rank_cp[slot++] = (int32_t)r;
+          if (i < n) r += sa_bit_get(out->sa_marked, i);
+      }
+    }
+
+    out->n_sampled = n_marked;
+    out->sa_sampled_val = xmalloc(sizeof(int32_t) * (size_t)(n_marked > 0 ? n_marked : 1));
+    for (int32_t i = 0; i < n; i++)
+        if (sa_bit_get(out->sa_marked, i)) out->sa_sampled_val[sa_rank1(out, i)] = sa[i];
+
+    /* Self-test: exhaustive for small chromosomes, a bounded random sample
+     * for large ones (checking all rows of a real chromosome-sized index
+     * would itself cost real time at genome scale -- 10,000 random rows
+     * is enough to catch a systematic bug, which is the failure mode that
+     * actually matters here, not a one-in-a-million row-specific fluke).
+     * Mirrors fm_self_test_sa_is()'s philosophy: this mechanism was
+     * validated standalone (571/571 passed across varied K and string
+     * shapes before this ever reached real chromosome data), but a
+     * standalone result from the past is not the same guarantee as
+     * checking the real, current data this run is actually about to
+     * build an index from. */
+    {
+        int32_t n_checks = n < 20000 ? n : 10000;
+        for (int32_t k = 0; k < n_checks; k++) {
+            int32_t row = (n < 20000) ? k : (int32_t)(((long)k * 2654435761UL) % (unsigned long)n);
+            if (fm_locate(out, row) != sa[row])
+                die("suffix-array sampling self-test failed against the full suffix array on "
+                    "real chromosome data -- refusing to build a --fm-index on a sampling "
+                    "mechanism that just disagreed with the known-correct full array it was "
+                    "built from. This should never happen; please report it, including the "
+                    "reference FASTA if possible.");
+        }
+    }
+
+    free(sa); /* the full suffix array is no longer needed once the sampled structure above
+                 is built and validated -- freeing it here is what actually realizes the
+                 memory reduction sampling exists for; keeping it around "just in case" would
+                 defeat the entire point of this round's work */
+}
+
+/* Builds one independent FM-index per chromosome (see the Round 5 design
+ * note above) instead of one concatenated multi-chromosome index. Called
+ * instead of build_kmer_index() when --fm-index is given. */
+static void fm_build(void) {
+    fm_self_test_sa_is(); /* re-validates SA-IS against its prefix-doubling oracle on real
+        chromosome data before trusting it with the actual index -- see the function's own
+        comment for why this runs every time rather than once, standalone, in the past */
+    g_fm = xmalloc(sizeof(FMIndex) * (size_t)n_chroms);
+    g_fm_n_chroms_built = n_chroms;
+    long peak_chrom_len = 0;
+    for (int ci = 0; ci < n_chroms; ci++) {
+        long clen = chroms[ci].len;
+        if (clen + 1 > (long)INT32_MAX)
+            die("chromosome too long for the per-chromosome FM-index (int32_t position limit) "
+                "-- this affects no known real chromosome (human's largest, chr1, is ~248 Mb); "
+                "fall back to the default minimizer index (omit --fm-index) for this input");
+        if (clen > peak_chrom_len) peak_chrom_len = clen;
+
+        unsigned char *codes = xmalloc((size_t)clen + 1);
+        for (long j = 0; j < clen; j++) {
+            int c = fm_code(chroms[ci].seq[j]);
+            codes[j] = (unsigned char)(c < 0 ? FM_ALPHA - 1 : c); /* ambiguous bases -> their
+                own dedicated symbol (see FM_ALPHA's comment) -- still can never be exactly
+                matched by a real query base (fm_code() returns -1 for those, and
+                fm_backward_search rejects any seed containing one before ever comparing
+                symbol values), but no longer collides with the sentinel below */
+        }
+        codes[clen] = 0; /* per-chromosome sentinel -- the UNIQUE occurrence of symbol 0 in
+                             this array now that ambiguous bases use FM_ALPHA-1 instead;
+                             SA-IS's correctness depends on that uniqueness (see FM_ALPHA) */
+
+        fm_build_one(&g_fm[ci], codes, (int32_t)(clen + 1));
+        free(codes); /* transient construction memory for this chromosome is now fully
+                        released before the next chromosome's arrays are allocated --
+                        this is what bounds peak memory by the largest chromosome, not
+                        the sum of all of them */
+    }
+    g_fm_built = 1;
+    printf("      -> FM-index built: %d independent per-chromosome suffix array(s) "
+           "(largest chromosome: %ld bp)\n", n_chroms, peak_chrom_len);
+}
+
 static void build_kmer_index(void) {
-    build_kmer_index_generic(kmer_table, KMER_TABLE_MASK, KMER_LEN, "main k-mer");
+    /* The main k-mer/minimizer table is only used by try_sw_align_multi()'s
+     * non-FM-index seeding path (see the `else` branch there) -- building
+     * it when --fm-index is active would be pure waste (memory spent on an
+     * index that's never queried), and would make any memory comparison
+     * between the two seeding approaches unfair by inflating the FM-index
+     * mode's footprint with an unused structure. Skipped accordingly. The
+     * splice-anchor table is built either way: it's used by
+     * try_spliced_align() regardless of which main-seeding path is active,
+     * and its memory is already bounded by MAX_SEED_HITS_PER_KMER
+     * independent of genome size (see MINIMIZER_WINDOW's comment), so
+     * there's no analogous waste to avoid there. */
+    if (!g_use_fm_index) build_kmer_index_minimizer(kmer_table, KMER_TABLE_MASK, KMER_LEN, MINIMIZER_WINDOW, "main k-mer");
     build_kmer_index_generic(kmer_table_splice, SPLICE_TABLE_MASK, SPLICE_KMER_LEN, "splice-anchor k-mer");
+    if (g_use_fm_index) fm_build();
+}
+
+/* Frees everything the reference index owns -- both k-mer hash tables'
+ * bucket arrays, every arena block backing their KmerEntry/SeedHit nodes,
+ * and every chromosome's heap-allocated sequence -- and resets n_chroms to
+ * 0, so load_reference() + build_kmer_index() can be called again for a
+ * *different* genome as if the program had just started. Used for
+ * contaminant screening (see try_contaminant_screen()), which needs a
+ * second, independent index built after the primary genome's index is no
+ * longer needed for anything (alignment, quantification, and every
+ * primary-genome-dependent output file are all already done and written
+ * by the time this runs -- see the call site in main() and the comment
+ * there for why that ordering is load-bearing correctness, not just
+ * convenience). Also doubles as the "free the k-mer index after alignment"
+ * memory optimization noted as deferred in README.md's Memory section,
+ * for the specific case where contaminant screening is requested (the
+ * only case where anything actually calls this). */
+static void free_reference_index(void) {
+    EntryArenaBlock *eb = entry_arena_head;
+    while (eb) { EntryArenaBlock *next = eb->next; free(eb); eb = next; }
+    entry_arena_head = NULL; entry_arena_used = ARENA_ENTRIES_PER_BLOCK;
+
+    HitsArenaBlock *hb = hits_arena_head;
+    while (hb) { HitsArenaBlock *next = hb->next; free(hb); hb = next; }
+    hits_arena_head = NULL; hits_arena_used = ARENA_HITS_PER_BLOCK;
+
+    memset(kmer_table, 0, sizeof(kmer_table));
+    memset(kmer_table_splice, 0, sizeof(kmer_table_splice));
+
+    for (int i = 0; i < n_chroms; i++) { free(chroms[i].seq); chroms[i].seq = NULL; }
+    n_chroms = 0;
+
+    if (g_fm) {
+        /* Pre-existing gap, closed while touching this exact code this pass:
+         * the FM-index's own heap allocations (per-chromosome bwt/sa/
+         * occ_checkpoints, plus the g_fm array itself) were never freed
+         * here, meaning --fm-index combined with contaminant screening
+         * (the only caller of this function) would leak the primary
+         * genome's entire FM-index before building a second one for the
+         * contaminant reference -- silent extra memory on exactly the
+         * memory-constrained path this session's work is about. n_chroms
+         * is already reset to 0 above, so this loop must use a remembered
+         * count instead. */
+        for (int i = 0; i < g_fm_n_chroms_built; i++) {
+            free(g_fm[i].bwt);
+            free(g_fm[i].occ_checkpoints);
+            free(g_fm[i].sa_marked);
+            free(g_fm[i].sa_rank_cp);
+            free(g_fm[i].sa_sampled_val);
+        }
+        free(g_fm);
+        g_fm = NULL;
+        g_fm_built = 0;
+        g_fm_n_chroms_built = 0;
+    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -531,6 +1644,23 @@ typedef struct {
     int  splice_table_bits;
     int  max_hits_per_kmer;
     int  n_chroms;
+    int  minimizer_window; /* Added when the main index switched from dense (every k-mer
+                               position stored) to minimizer-sparse (see MINIMIZER_WINDOW):
+                               without this, a cache built by a dense-indexing binary would
+                               pass every other check here unchanged (same KMER_LEN, same
+                               table_bits, etc.) and get silently loaded by a newer
+                               sparse-indexing binary as-is -- not a correctness bug (the
+                               lookup logic is unchanged; a denser-than-expected table still
+                               answers queries correctly), but a silent performance/memory
+                               regression that would defeat the whole point of the
+                               optimization without any error or warning. Found while
+                               benchmarking the two indexing schemes against each other and
+                               nearly measuring the wrong thing as a result. Old caches
+                               (written before this field existed) have whatever bytes
+                               happened to be there interpreted as this field, which will
+                               essentially never coincidentally equal MINIMIZER_WINDOW's
+                               current value -- so they correctly fail validation and get
+                               rebuilt, rather than needing an explicit "version 0" case. */
 } IndexCacheHeader;
 
 static void cache_path_for(const char *ref_path, char *out, size_t outsz) {
@@ -665,6 +1795,7 @@ static int try_load_index_cache(const char *ref_path) {
              hdr.kmer_len == KMER_LEN && hdr.splice_kmer_len == SPLICE_KMER_LEN &&
              hdr.table_bits == KMER_TABLE_BITS && hdr.splice_table_bits == SPLICE_TABLE_BITS &&
              hdr.max_hits_per_kmer == MAX_SEED_HITS_PER_KMER &&
+             hdr.minimizer_window == MINIMIZER_WINDOW &&
              hdr.n_chroms > 0 && hdr.n_chroms <= MAX_CHROMS;
     if (ok) {
         n_chroms = hdr.n_chroms;
@@ -696,6 +1827,7 @@ static void save_index_cache(const char *ref_path) {
     hdr.kmer_len = KMER_LEN; hdr.splice_kmer_len = SPLICE_KMER_LEN;
     hdr.table_bits = KMER_TABLE_BITS; hdr.splice_table_bits = SPLICE_TABLE_BITS;
     hdr.max_hits_per_kmer = MAX_SEED_HITS_PER_KMER;
+    hdr.minimizer_window = MINIMIZER_WINDOW;
     hdr.n_chroms = n_chroms;
     fwrite(&hdr, sizeof(hdr), 1, f);
     for (int i = 0; i < n_chroms; i++) write_chrom(f, &chroms[i]);
@@ -727,7 +1859,8 @@ static void extract_attr(const char *attrs, const char *key, char *out, size_t o
 }
 
 static void load_gtf(const char *path) {
-    FILE *f = fopen(path, "r");
+    int is_pipe;
+    FILE *f = open_maybe_gz(path, &is_pipe);
     if (!f) die("cannot open GTF annotation");
 
     char line[MAX_LINE];
@@ -772,6 +1905,8 @@ static void load_gtf(const char *path) {
             g->start = start;
             g->end = end;
             g->strand = strand_s[0];
+            extract_attr(attrs, "gene_biotype", g->biotype, sizeof(g->biotype));
+            if (g->biotype[0] == '\0') strncpy(g->biotype, "unknown", sizeof(g->biotype) - 1);
             g->unique_count = 0;
             g->effective_count = 0.0;
         } else {
@@ -779,7 +1914,7 @@ static void load_gtf(const char *path) {
             if (end > genes[idx].end) genes[idx].end = end;
         }
     }
-    fclose(f);
+    close_maybe_gz(f, is_pipe);
     if (n_genes == 0) die("no gene-bearing features (gene/transcript/exon/CDS/...) found in GTF");
 }
 
@@ -881,57 +2016,128 @@ static void init_read_slot(Read *r, const char *id_line, const char *seq_line,
     r->mate_idx = mate_idx;
 }
 
-static void load_fastq_se(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) die("cannot open FASTQ reads file");
-    reads = xmalloc(sizeof(Read) * MAX_READS);
+/* ---------------------------------------------------------------------- */
+/* Multi-lane FASTQ merging                                               */
+/*                                                                        */
+/* nf-core/rnaseq accepts one samplesheet row per sequencing lane and     */
+/* concatenates same-sample lanes (via its CAT_FASTQ module) before any   */
+/* trimming/alignment happens -- a sample run across 4 lanes on a         */
+/* NovaSeq, say, becomes one logical FASTQ stream. This pipeline has no   */
+/* samplesheet, so the equivalent entry point is the read-path argument   */
+/* itself: a comma-separated list of paths (each independently            */
+/* gzip/plain, same as a single path) is treated as one sample's lanes    */
+/* and concatenated in the order given, exactly like nf-core's `cat`.     */
+/* A single path with no comma is unaffected -- fully backward-compatible */
+/* with every existing invocation. */
+#define MAX_LANES 64
 
-    char l1[MAX_LINE], l2[MAX_LINE], l3[MAX_LINE], l4[MAX_LINE];
-    while (fgets(l1, sizeof(l1), f)) {
-        if (!fgets(l2, sizeof(l2), f)) break;
-        if (!fgets(l3, sizeof(l3), f)) break;
-        if (!fgets(l4, sizeof(l4), f)) break;
-        rstrip(l1); rstrip(l2); rstrip(l3); rstrip(l4);
-        if (l1[0] != '@') continue;
-        if (n_reads >= MAX_READS) die("too many reads for demo buffer (increase MAX_READS)");
-        init_read_slot(&reads[n_reads], l1, l2, l4, 0, -1);
-        n_reads++;
+/* Splits a comma-separated path list into up to MAX_LANES paths (each up
+ * to MAX_LANE_PATH-1 bytes). Returns the number of paths found. Does not
+ * modify path_list. Empty entries (a stray leading/trailing/doubled
+ * comma) are rejected with die() rather than silently skipped, since a
+ * silently-dropped lane would quietly under-count a sample. */
+#define MAX_LANE_PATH 1024
+static int split_lane_paths(const char *path_list, char out[MAX_LANES][MAX_LANE_PATH]) {
+    int n = 0;
+    const char *p = path_list;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == 0) die("empty path in comma-separated FASTQ lane list (check for a stray comma)");
+        if (len >= MAX_LANE_PATH) { char eb[64]; snprintf(eb, sizeof(eb), "FASTQ lane path too long (max %d chars)", MAX_LANE_PATH - 1); die(eb); }
+        if (n >= MAX_LANES) { char eb[80]; snprintf(eb, sizeof(eb), "too many comma-separated FASTQ lanes for one sample (max %d)", MAX_LANES); die(eb); }
+        memcpy(out[n], p, len);
+        out[n][len] = '\0';
+        n++;
+        p += len;
+        if (*p == ',') p++;
     }
-    fclose(f);
-    if (n_reads == 0) die("no reads found in FASTQ file");
+    if (n == 0) die("empty FASTQ path");
+    return n;
 }
 
-static void load_fastq_pe(const char *path1, const char *path2) {
-    FILE *f1 = fopen(path1, "r");
-    if (!f1) die("cannot open R1 FASTQ file");
-    FILE *f2 = fopen(path2, "r");
-    if (!f2) die("cannot open R2 FASTQ file");
+static void load_fastq_se(const char *path_list) {
+    char lane_paths[MAX_LANES][MAX_LANE_PATH];
+    int n_lanes = split_lane_paths(path_list, lane_paths);
+
+    reads = xmalloc(sizeof(Read) * MAX_READS);
+    char l1[MAX_LINE], l2[MAX_LINE], l3[MAX_LINE], l4[MAX_LINE];
+
+    for (int lane = 0; lane < n_lanes; lane++) {
+        int is_pipe;
+        FILE *f = open_maybe_gz(lane_paths[lane], &is_pipe);
+        if (!f) { char eb[MAX_LANE_PATH + 64]; snprintf(eb, sizeof(eb), "cannot open FASTQ reads file: %s", lane_paths[lane]); die(eb); }
+        int lane_reads = 0;
+        while (fgets(l1, sizeof(l1), f)) {
+            if (!fgets(l2, sizeof(l2), f)) break;
+            if (!fgets(l3, sizeof(l3), f)) break;
+            if (!fgets(l4, sizeof(l4), f)) break;
+            rstrip(l1); rstrip(l2); rstrip(l3); rstrip(l4);
+            if (l1[0] != '@') continue;
+            if (n_reads >= MAX_READS) die("too many reads for demo buffer (increase MAX_READS)");
+            init_read_slot(&reads[n_reads], l1, l2, l4, 0, -1);
+            n_reads++;
+            lane_reads++;
+        }
+        close_maybe_gz(f, is_pipe);
+        if (n_lanes > 1)
+            printf("      lane %d/%d (%s): %d read(s)\n", lane + 1, n_lanes, lane_paths[lane], lane_reads);
+    }
+    if (n_reads == 0) die("no reads found in FASTQ file(s)");
+}
+
+static void load_fastq_pe(const char *path1_list, const char *path2_list) {
+    char lane_paths1[MAX_LANES][MAX_LANE_PATH], lane_paths2[MAX_LANES][MAX_LANE_PATH];
+    int n_lanes1 = split_lane_paths(path1_list, lane_paths1);
+    int n_lanes2 = split_lane_paths(path2_list, lane_paths2);
+    if (n_lanes1 != n_lanes2) {
+        char eb[192];
+        snprintf(eb, sizeof(eb),
+                 "R1 lane count (%d) does not match R2 lane count (%d) -- each R1 lane needs a "
+                 "corresponding R2 lane, in the same order", n_lanes1, n_lanes2);
+        die(eb);
+    }
+    int n_lanes = n_lanes1;
 
     reads = xmalloc(sizeof(Read) * MAX_READS);
     char a1[MAX_LINE], a2[MAX_LINE], a3[MAX_LINE], a4[MAX_LINE];
     char b1[MAX_LINE], b2[MAX_LINE], b3[MAX_LINE], b4[MAX_LINE];
     int mismatched_ids = 0;
 
-    while (fgets(a1, sizeof(a1), f1)) {
-        if (!fgets(a2, sizeof(a2), f1) || !fgets(a3, sizeof(a3), f1) || !fgets(a4, sizeof(a4), f1)) break;
-        if (!fgets(b1, sizeof(b1), f2) || !fgets(b2, sizeof(b2), f2) ||
-            !fgets(b3, sizeof(b3), f2) || !fgets(b4, sizeof(b4), f2)) {
-            fprintf(stderr, "WARNING: R2 file ran out of reads before R1; truncating pairs here.\n");
-            break;
-        }
-        rstrip(a1); rstrip(a2); rstrip(a4);
-        rstrip(b1); rstrip(b2); rstrip(b4);
-        if (a1[0] != '@' || b1[0] != '@') continue;
-        if (n_reads + 2 > MAX_READS) die("too many reads for demo buffer (increase MAX_READS)");
+    for (int lane = 0; lane < n_lanes; lane++) {
+        int is_pipe1, is_pipe2;
+        FILE *f1 = open_maybe_gz(lane_paths1[lane], &is_pipe1);
+        if (!f1) { char eb[MAX_LANE_PATH + 64]; snprintf(eb, sizeof(eb), "cannot open R1 FASTQ file: %s", lane_paths1[lane]); die(eb); }
+        FILE *f2 = open_maybe_gz(lane_paths2[lane], &is_pipe2);
+        if (!f2) { char eb[MAX_LANE_PATH + 64]; snprintf(eb, sizeof(eb), "cannot open R2 FASTQ file: %s", lane_paths2[lane]); die(eb); }
 
-        int i1 = n_reads, i2 = n_reads + 1;
-        init_read_slot(&reads[i1], a1, a2, a4, 1, i2);
-        init_read_slot(&reads[i2], b1, b2, b4, 2, i1);
-        if (strcmp(reads[i1].id, reads[i2].id) != 0) mismatched_ids++;
-        n_reads += 2;
+        int lane_pairs = 0;
+        while (fgets(a1, sizeof(a1), f1)) {
+            if (!fgets(a2, sizeof(a2), f1) || !fgets(a3, sizeof(a3), f1) || !fgets(a4, sizeof(a4), f1)) break;
+            if (!fgets(b1, sizeof(b1), f2) || !fgets(b2, sizeof(b2), f2) ||
+                !fgets(b3, sizeof(b3), f2) || !fgets(b4, sizeof(b4), f2)) {
+                fprintf(stderr, "WARNING: R2 file ran out of reads before R1 in lane %d/%d; truncating pairs there.\n",
+                        lane + 1, n_lanes);
+                break;
+            }
+            rstrip(a1); rstrip(a2); rstrip(a4);
+            rstrip(b1); rstrip(b2); rstrip(b4);
+            if (a1[0] != '@' || b1[0] != '@') continue;
+            if (n_reads + 2 > MAX_READS) die("too many reads for demo buffer (increase MAX_READS)");
+
+            int i1 = n_reads, i2 = n_reads + 1;
+            init_read_slot(&reads[i1], a1, a2, a4, 1, i2);
+            init_read_slot(&reads[i2], b1, b2, b4, 2, i1);
+            if (strcmp(reads[i1].id, reads[i2].id) != 0) mismatched_ids++;
+            n_reads += 2;
+            lane_pairs++;
+        }
+        close_maybe_gz(f1, is_pipe1); close_maybe_gz(f2, is_pipe2);
+        if (n_lanes > 1)
+            printf("      lane %d/%d (%s + %s): %d pair(s)\n",
+                   lane + 1, n_lanes, lane_paths1[lane], lane_paths2[lane], lane_pairs);
     }
-    fclose(f1); fclose(f2);
-    if (n_reads == 0) die("no read pairs found in FASTQ files");
+    if (n_reads == 0) die("no read pairs found in FASTQ file(s)");
     if (mismatched_ids)
         fprintf(stderr, "WARNING: %d read pair(s) had mismatched IDs between R1/R2 (order-based pairing used anyway)\n",
                 mismatched_ids);
@@ -940,6 +2146,44 @@ static void load_fastq_pe(const char *path1, const char *path2) {
 /* ---------------------------------------------------------------------- */
 /* QC (pre-trim)                                                          */
 /* ---------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------- */
+/* UMI extraction (optional, --umi-len N)                                 */
+/* ---------------------------------------------------------------------- */
+
+/* Extracts a fixed-length UMI from the start of each read's mate-1 (or the
+ * read itself, single-end) -- the common in-line UMI layout (e.g.
+ * QIAseq/NEBNext-style kits: UMI + spacer trimmed from R1's 5' end before
+ * the biological insert). This is a deliberate, documented scope choice,
+ * not full generality: protocols that put the UMI on R2, split it across
+ * both mates, or use a separate index read entirely are not handled --
+ * see README.md's UMI section for what would be needed to extend this.
+ * The UMI bases are removed from the read's usable sequence (hard-clipped,
+ * like adapter trimming) so they never end up seeding/extending an
+ * alignment as if they were genomic sequence. Called once, right after
+ * FASTQ loading and before QC/trimming/alignment. */
+static void extract_umis(int umi_len) {
+    if (umi_len <= 0) return;
+    for (int i = 0; i < n_reads; i++) {
+        Read *r = &reads[i];
+        if (r->read_num == 2) continue; /* R2: UMI already extracted from its R1 mate */
+        if (r->raw_len <= umi_len) continue; /* too short to have both a UMI and any insert */
+        memcpy(r->umi, r->seq, umi_len);
+        r->umi[umi_len] = '\0';
+        if (r->read_num == 1 && r->mate_idx >= 0) {
+            /* propagate to the mate so both halves of a fragment carry the
+             * same UMI string for the dedup key later */
+            strncpy(reads[r->mate_idx].umi, r->umi, MAX_UMI_LEN);
+            reads[r->mate_idx].umi[MAX_UMI_LEN] = '\0';
+        }
+        int new_len = r->raw_len - umi_len;
+        memmove(r->seq, r->seq + umi_len, new_len);
+        memmove(r->qual, r->qual + umi_len, new_len);
+        r->seq[new_len] = '\0';
+        r->qual[new_len] = '\0';
+        r->raw_len = new_len;
+    }
+}
 
 static void compute_raw_qc(Read *r) {
     int gc = 0, n = 0;
@@ -1150,16 +2394,46 @@ static int sw_local_align(const Chrom *chrom, long window_start, long window_len
 
 #undef SWIDX
 
+    /* Write the CIGAR out, tracking exactly how many query bases (M/I/S)
+     * have actually been placed into out->cigar as we go. If the op cap is
+     * ever hit -- rev_ops[] is bounded by MAX_CIGAR_OPS-1 in the traceback
+     * loop above, and out->cigar[] by MAX_CIGAR_OPS here -- any bases that
+     * didn't make it into an emitted op are folded into the trailing
+     * soft-clip rather than silently dropped. This guarantees
+     * sum(M/I/S lengths in the emitted CIGAR) == qlen unconditionally, which
+     * is required for the CIGAR to describe the SEQ field at all (a mismatch
+     * there is rejected by samtools/picard/any correct SAM consumer). See
+     * the MAX_CIGAR_OPS comment above for how this was found. */
     out->n_cigar = 0;
-    if (start_i > 0) { out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = start_i; out->n_cigar++; }
+    int q_placed = 0; /* query bases accounted for by ops emitted so far */
+    if (start_i > 0) {
+        out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = start_i; out->n_cigar++;
+        q_placed += start_i;
+    }
     for (int k = n_rev - 1; k >= 0 && out->n_cigar < MAX_CIGAR_OPS; k--) {
         if (out->n_cigar > 0 && out->cigar[out->n_cigar-1].op == rev_ops[k].op) out->cigar[out->n_cigar-1].len += rev_ops[k].len;
         else { out->cigar[out->n_cigar] = rev_ops[k]; out->n_cigar++; }
+        if (rev_ops[k].op == 'M' || rev_ops[k].op == 'I') q_placed += rev_ops[k].len;
     }
-    int trailing_clip = qlen - best_i;
-    if (trailing_clip > 0 && out->n_cigar < MAX_CIGAR_OPS) {
-        if (out->n_cigar > 0 && out->cigar[out->n_cigar-1].op == 'S') out->cigar[out->n_cigar-1].len += trailing_clip;
-        else { out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = trailing_clip; out->n_cigar++; }
+    /* Any traceback ops that couldn't be emitted (rev_ops truncated by the
+     * MAX_CIGAR_OPS-1 walk cap, or out->cigar filled up above) still
+     * consumed query bases between start_i and best_i; qlen - best_i is the
+     * separately-tracked trailing local-alignment clip. Both gaps collapse
+     * into one soft-clip so the total always reconciles to qlen. */
+    int trailing_clip = qlen - q_placed;
+    if (trailing_clip > 0) {
+        if (out->n_cigar > 0 && out->cigar[out->n_cigar-1].op == 'S') {
+            out->cigar[out->n_cigar-1].len += trailing_clip;
+        } else if (out->n_cigar < MAX_CIGAR_OPS) {
+            out->cigar[out->n_cigar].op = 'S'; out->cigar[out->n_cigar].len = trailing_clip; out->n_cigar++;
+        } else {
+            /* Every slot is full (should not happen at MAX_CIGAR_OPS=48 for
+             * real short-read data) -- extend the last op rather than drop
+             * bases. This changes what the last op "means" in a pathological
+             * case, but an inflated M/I run is still a valid, length-correct
+             * CIGAR, whereas silently short-counting SEQ is not. */
+            out->cigar[out->n_cigar-1].len += trailing_clip;
+        }
     }
 
     out->ref_start = window_start + j; /* j now holds the ref offset where alignment starts */
@@ -1178,21 +2452,134 @@ static int sw_local_align(const Chrom *chrom, long window_start, long window_len
  * (see the EM quantification stage) while still supporting indels. */
 typedef struct { int chrom_idx; long implied_start; } SwCandidate;
 
+/* Read-side counterpart to index_chrom_minimizers(): computes the same
+ * minimizer selection (same k, same window) over a short query sequence,
+ * so that seeding queries the sparse main index with the positions it can
+ * actually find something at, instead of 3 fixed offsets that would mostly
+ * miss a sparsified index. This is what makes MINIMIZER_WINDOW's
+ * memory-reduction actually work correctly rather than just reducing
+ * sensitivity: for a genuinely shared region between read and reference of
+ * length >= KMER_LEN + MINIMIZER_WINDOW - 1, the read's own minimizer for
+ * the corresponding window is, by construction, the exact same k-mer value
+ * the reference stored for that window (the sequences agree there) --
+ * checking every one of the read's minimizer-selected offsets against the
+ * table restores the seeding guarantee the old fixed-3-offset approach
+ * relied on dense indexing for. Reads are short (a few hundred bases at
+ * most), so this costs a handful of extra table lookups per read, not a
+ * scaling problem. out_offsets must have room for at least qlen positions
+ * (worst case one minimizer per position, though in practice far fewer). */
+static int compute_read_minimizers(const char *query, int qlen, int k, int window, int *out_offsets) {
+    int n_pos = qlen - k + 1;
+    if (n_pos <= 0) return 0;
+
+    uint32_t val[MAX_READ_LEN], mixed[MAX_READ_LEN];
+    unsigned char valid[MAX_READ_LEN];
+    for (int p = 0; p < n_pos; p++) {
+        uint32_t kmer;
+        valid[p] = (unsigned char)encode_kmer(query + p, k, &kmer);
+        val[p] = kmer;
+        mixed[p] = valid[p] ? mix32(kmer) : 0xFFFFFFFFu;
+    }
+
+    /* Same O(n_pos) monotonic-deque sliding-window minimum as
+     * index_chrom_minimizers() above (see its comment for the full
+     * rationale, including why mixed values rather than raw ones are
+     * compared) -- reads are short (n_pos bounded by MAX_READ_LEN, a few
+     * hundred), so this is cheap regardless, but the earlier
+     * O(n_pos * window) version of this specific function, called on
+     * every read on every strand, was the single largest contributor to a
+     * measured ~3.4x alignment-stage slowdown after minimizer indexing was
+     * introduced (see README.md's Performance section) -- worth using the
+     * efficient version here even more than on the reference-indexing
+     * side, since this runs millions of times per pipeline run instead of
+     * once. */
+    int dq[MAX_READ_LEN];
+    int dq_head = 0, dq_tail = 0;
+    int n_out = 0, last_stored = -1;
+    for (int p = 0; p < n_pos; p++) {
+        while (dq_tail > dq_head && mixed[dq[dq_tail - 1]] >= mixed[p]) dq_tail--;
+        dq[dq_tail++] = p;
+        while (dq[dq_head] <= p - window) dq_head++;
+
+        if (p >= window - 1) {
+            int best_pos = dq[dq_head];
+            if (valid[best_pos] && best_pos != last_stored) {
+                out_offsets[n_out++] = best_pos;
+                last_stored = best_pos;
+            }
+        }
+    }
+
+    /* Always also check the very first and very last possible k-mer
+     * offsets directly (not just whatever the minimizer scheme selected)
+     * -- cheap insurance against the read being shorter than one full
+     * window (n_pos < window, so the loop above never runs at all) or
+     * other edge cases, at the cost of at most 2 extra lookups per read. */
+    if (n_out == 0 || out_offsets[0] != 0) { if (n_out < qlen) out_offsets[n_out++] = 0; }
+    if (n_pos - 1 >= 0 && (n_out == 0 || out_offsets[n_out - 1] != n_pos - 1)) {
+        if (n_out < qlen) out_offsets[n_out++] = n_pos - 1;
+    }
+    return n_out;
+}
+
 static int try_sw_align_multi(const char *query, int qlen, char strand,
                                Hit *out_hits, int *n_out, int *best_score_out) {
     if (qlen < KMER_LEN) return 0;
 
-    int seed_offsets[3], n_seeds = 0;
-    seed_offsets[n_seeds++] = 0;
-    if (qlen - KMER_LEN > 0) {
-        int mid = (qlen - KMER_LEN) / 2;
-        if (mid != 0) seed_offsets[n_seeds++] = mid;
-        seed_offsets[n_seeds++] = qlen - KMER_LEN;
-    }
+    int seed_offsets[MAX_READ_LEN];
+    int n_seeds = compute_read_minimizers(query, qlen, KMER_LEN, MINIMIZER_WINDOW, seed_offsets);
 
     SwCandidate cands[MAX_CAND_POS];  /* was `static` -- shared/racy across OpenMP threads;
                                         * this is only 64*16=1KB, cheap on the stack. */
     int n_cand = 0;
+
+    if (g_use_fm_index && g_fm_built) {
+        /* FM-index seeding: same minimizer-selected offsets as the k-mer
+         * path (so both paths do comparable seeding density). Each seed
+         * now runs one backward search PER CHROMOSOME (one independent
+         * FM-index per chromosome -- see the Round 5 design note above
+         * fm_build_one()), instead of one global search over a
+         * concatenated index -- the memory-vs-search-count tradeoff that
+         * change makes, measured rather than assumed, in README.md's
+         * Memory section. Each search still directly returns every exact
+         * occurrence *in that chromosome*, not just whatever happened to
+         * land in one hash bucket; MAX_SEED_HITS_PER_KMER still caps how
+         * many hits from one seed are used, same protection against
+         * repetitive-region blowup the k-mer path already has -- applied
+         * per chromosome here, so a seed repetitive within one
+         * chromosome doesn't suppress real hits found in another. */
+        int coded[MAX_READ_LEN];
+        for (int s = 0; s < n_seeds && n_cand < MAX_CAND_POS; s++) {
+            int so = seed_offsets[s];
+            if (so + KMER_LEN > qlen) continue;
+            int bad = 0;
+            for (int i = 0; i < KMER_LEN; i++) {
+                coded[i] = fm_code(query[so + i]);
+                if (coded[i] < 0) { bad = 1; break; }
+            }
+            if (bad) continue;
+            for (int ci = 0; ci < n_chroms && n_cand < MAX_CAND_POS; ci++) {
+                long lo, hi;
+                fm_backward_search(&g_fm[ci], coded, KMER_LEN, &lo, &hi);
+                long n_hits = hi - lo;
+                if (n_hits <= 0 || n_hits > MAX_SEED_HITS_PER_KMER) continue; /* 0 = no exact
+                                    match in this chromosome; too many = uninformative repeat,
+                                    same treatment the k-mer path gives an over-full bucket */
+                for (long i = lo; i < hi && n_cand < MAX_CAND_POS; i++) {
+                    long local_pos = fm_locate(&g_fm[ci], i); /* Round 7: recovered via
+                        LF-mapping from the sampled suffix array, not a direct array read --
+                        still chromosome-local, no offset-mapping step needed either way */
+                    long implied_start = local_pos - so;
+                    int dup = 0;
+                    for (int c = 0; c < n_cand; c++)
+                        if (cands[c].chrom_idx == ci &&
+                            labs(cands[c].implied_start - implied_start) < SW_PAD) { dup = 1; break; }
+                    if (dup) continue;
+                    cands[n_cand].chrom_idx = ci; cands[n_cand].implied_start = implied_start; n_cand++;
+                }
+            }
+        }
+    } else {
     for (int s = 0; s < n_seeds; s++) {
         int so = seed_offsets[s];
         uint32_t kmer;
@@ -1208,6 +2595,9 @@ static int try_sw_align_multi(const char *query, int qlen, char strand,
             if (dup) continue;
             if (n_cand < MAX_CAND_POS) { cands[n_cand].chrom_idx = e->hits[h].chrom_idx; cands[n_cand].implied_start = implied_start; n_cand++; }
         }
+        if (n_cand >= MAX_CAND_POS) break; /* candidate array full; more seed offsets
+                                                wouldn't fit anyway */
+    }
     }
     if (n_cand == 0) return 0;
     if (n_cand > SW_MAX_CANDIDATES) n_cand = SW_MAX_CANDIDATES;
@@ -1308,6 +2698,24 @@ static void spl_scratch_ensure(int qlen_plus1) {
 }
 
 static int try_spliced_align(const char *query, int qlen, char strand, Hit *out) {
+    /* Distance tiebreak (added alongside --max-intron becoming configurable):
+     * `better` below now also prefers the SHORTER intron when canonical
+     * status AND mismatch count are BOTH tied -- previously, ties broke
+     * arbitrarily in scan order, which the junction-annotation validation
+     * found let through a residual of implausibly long "novel" calls even
+     * after the align_read() gating fix and the tighter MAX_INTRON default
+     * (8 of 38 remaining novel junctions were still >5,000bp on the real
+     * 100k-read-pair yeast run -- see README.md's Junction annotation
+     * section). That residual was tolerable at MAX_INTRON=15,000 (few
+     * candidates, narrow window); it would NOT be tolerable at a
+     * human-appropriate window past 1,000,000bp, where far more candidate
+     * (c1,intron) pairs get evaluated per read and the chance of a
+     * same-mismatch-count coincidence rises accordingly. This tiebreak is
+     * a real, direct answer to that -- not a fully general fix (it only
+     * helps when a *tie* exists; it doesn't add any new discrimination
+     * power between candidates that already differ on mismatch count),
+     * but it's the specific, well-scoped piece of the "still open" item
+     * this pass could close without redesigning the scoring model. */
     if (qlen < 2 * SPLICE_KMER_LEN + 4) return 0;
 
     uint32_t kmer_l, kmer_r;
@@ -1335,7 +2743,7 @@ static int try_spliced_align(const char *query, int qlen, char strand, Hit *out)
             if (er->hits[j].chrom_idx != ci) continue;
             long c2 = er->hits[j].pos;
             long intron = (c2 - c1) - (long)(qlen - SPLICE_KMER_LEN);
-            if (intron < MIN_INTRON || intron > MAX_INTRON) continue;
+            if (intron < MIN_INTRON || intron > g_max_intron) continue;
             if (c1 < 0) continue;
 
             /* Bounds, derived to exactly match what the per-breakpoint
@@ -1397,7 +2805,35 @@ static int try_spliced_align(const char *query, int qlen, char strand, Hit *out)
                     if (d1 == 'G' && d2 == 'T' && a1 == 'A' && a2 == 'G') canon = 1;
                 }
 
-                int better = !found || (canon && !best_canon) || (canon == best_canon && total < best_mm);
+                /* Hard canonical gate beyond SPLICE_SAFE_INTRON_RANGE -- the
+                 * actual fix for the failure mode measured when --max-intron
+                 * is widened past the yeast-validated default (see this
+                 * function's opening comment and README.md's Known gaps
+                 * list): a distant, coincidentally-matching position can win
+                 * OUTRIGHT on mismatch count, not just on a tie, which the
+                 * distance tiebreak above can't catch (it only fires when
+                 * candidates are already tied). Requiring canonical GT-AG
+                 * for anything beyond the safe range removes that entire
+                 * failure mode at the source, rather than trying to out-vote
+                 * it after the fact: real eukaryotic introns are >98%
+                 * canonical, so a genuine long intron essentially always
+                 * clears this bar, while a spurious distant match needs to
+                 * ALSO coincidentally land on GT..AG -- a 1-in-256 event
+                 * for a uniformly random position, not something a wide
+                 * search window's extra candidates make likely en masse the
+                 * way "fewer mismatches, no site requirement" did. Within
+                 * the safe range, behavior is completely unchanged from
+                 * before this fix (canonical still just preferred, not
+                 * required) -- this is strictly additive for wide windows,
+                 * not a change to already-validated short-range behavior. */
+                if (intron > SPLICE_SAFE_INTRON_RANGE && !canon) continue;
+
+                int better = !found
+                    || (canon && !best_canon)
+                    || (canon == best_canon && total < best_mm)
+                    || (canon == best_canon && total == best_mm && intron < best_intron);
+                    /* the last clause is the distance tiebreak -- see this
+                       function's opening comment for why it was added */
                 if (better) {
                     found = 1; best_mm = total; best_canon = canon;
                     best_chrom = ci; best_c1 = c1; best_intron = intron; best_b = (int)b;
@@ -1475,20 +2911,45 @@ static void align_read(Read *r) {
         sw_coverage = hit_aligned_bases(rep);
     }
 
-    if (sw_coverage < r->trimmed_len) {
+    if (sw_coverage < 0 || (r->trimmed_len - sw_coverage) >= SPLICE_KMER_LEN) {
+        /* Only worth trying splice detection if either SW found nothing at
+         * all, or the unexplained (soft-clipped) portion is at least one
+         * splice anchor's worth of sequence (SPLICE_KMER_LEN) -- reusing
+         * that constant here rather than inventing a new threshold, since
+         * try_spliced_align() itself requires exactly that much anchor on
+         * each side to even attempt a match, so a smaller clip could never
+         * represent a genuine splice-spanning read by this detector's own
+         * construction. Previously this ran (and, worse, its result was
+         * used unconditionally) for ANY nonzero soft-clip, including the
+         * single mismatched or adapter-remnant base at a read's edge that
+         * ordinary sequencing error/quality trimming leaves behind on a
+         * huge fraction of otherwise well-aligned reads -- see the
+         * "A real bug this surfaced" note under Junction annotation in
+         * README.md for the specific, measured false-positive pattern
+         * (median ~5,000bp "novel" splice calls vs. ~326bp for real ones)
+         * this gating change was added to fix. */
         Hit sf, sr;
         int ok_sf = try_spliced_align(r->seq, r->trimmed_len, '+', &sf);
         int ok_sr = try_spliced_align(rc, r->trimmed_len, '-', &sr);
         if (ok_sf || ok_sr) {
             Hit *best = (ok_sf && ok_sr) ? (sf.mismatches <= sr.mismatches ? &sf : &sr) : (ok_sf ? &sf : &sr);
-            r->aln.hits = xmalloc(sizeof(Hit));
-            r->aln.hits[0] = *best;
-            r->aln.n_hits = 1;
-            r->aln.mapped = 1;
-            #pragma omp atomic
-            n_spliced_alignments++;
-            free(rc);
-            return;
+            int splice_coverage = hit_aligned_bases(best); /* always == trimmed_len by
+                construction (splice hits cover the full read), kept explicit rather than
+                assumed so the comparison below states its own reasoning */
+            if (sw_coverage < 0 || splice_coverage > sw_coverage) {
+                r->aln.hits = xmalloc(sizeof(Hit));
+                r->aln.hits[0] = *best;
+                r->aln.n_hits = 1;
+                r->aln.mapped = 1;
+                #pragma omp atomic
+                n_spliced_alignments++;
+                free(rc);
+                return;
+            }
+            /* Splice path found *something*, but it explains no more of the
+             * read than the SW alignment already on hand -- fall through
+             * and use that instead, rather than accepting a spliced
+             * "explanation" that isn't actually a better one. */
         }
     }
 
@@ -1518,7 +2979,758 @@ static void align_read(Read *r) {
 /* resolution, simplified: no fragment-length or sequence-bias model).    */
 /* ---------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------- */
+/* UMI-aware duplicate marking (optional, --umi-len N)                    */
+/* ---------------------------------------------------------------------- */
+
+/* UMI-tools' "directional" method (its default): two UMIs at the same
+ * (chrom, alignment start, strand) are considered the same underlying
+ * molecule if they're within Hamming distance 1 of each other AND the
+ * higher-count one has at least ~2x the read support of the lower-count
+ * one (the ratio a single sequencing error would plausibly produce via
+ * PCR amplification of the true molecule, vs. two independently-primed
+ * true molecules that happen to land on similar UMIs by chance). This
+ * catches PCR duplicates whose UMI read had a sequencing error, which
+ * pure exact-match dedup (this pipeline's previous method) cannot.
+ *
+ * This is a real, working implementation of that algorithm, not just the
+ * name: distinct UMIs at each position are bucketed, sorted by count
+ * descending, and clustered via BFS over the count-directional adjacency
+ * graph (documented simplification vs. UMI-tools' exact implementation:
+ * a cluster's absorption threshold uses its original highest-count
+ * representative throughout the BFS, rather than re-deriving per-edge
+ * thresholds -- this is easier to verify correct and matches the common
+ * case, but can differ from UMI-tools in some multi-hop edge cases).
+ * Within each resulting cluster, the single highest-count UMI's first
+ * occurrence is kept; everything else in the cluster (both exact
+ * repeats and edit-distance-1 relatives) is marked a duplicate.
+ *
+ * Groups with more than MAX_UMIS_PER_POSITION_GROUP distinct UMIs at one
+ * position fall back to exact-match only for that group, to avoid O(k^2)
+ * blowup on pathologically deep pileups -- a safety valve, not silent
+ * data loss: those reads still get exact-match dedup, just not the
+ * clustering upgrade. */
+#define MAX_UMIS_PER_POSITION_GROUP 500
+
+typedef struct { int chrom_idx; long pos; char strand; int read_idx; } PosKey;
+
+static int poskey_cmp(const void *a, const void *b) {
+    const PosKey *ka = (const PosKey *)a, *kb = (const PosKey *)b;
+    if (ka->chrom_idx != kb->chrom_idx) return ka->chrom_idx - kb->chrom_idx;
+    if (ka->pos != kb->pos) return (ka->pos < kb->pos) ? -1 : 1;
+    return (unsigned char)ka->strand - (unsigned char)kb->strand;
+}
+
+static int umi_hamming_le1(const char *a, const char *b, int len) {
+    int mm = 0;
+    for (int i = 0; i < len; i++) if (a[i] != b[i]) { if (++mm > 1) return 0; }
+    return 1;
+}
+
+typedef struct { char umi[MAX_UMI_LEN + 1]; int count; int first_read_idx; int cluster; } UmiBucket;
+
+static long n_duplicate_units = 0;
+static long n_duplicate_units_via_clustering = 0; /* subset of n_duplicate_units caught ONLY
+                                because of directional-adjacency clustering (edit-distance-1
+                                relatives), i.e. beyond what exact-match alone would have found --
+                                reported separately so the upgrade over the previous "unique"
+                                method is measurable, not just asserted */
+static int global_umi_len_used = 0; /* set from main()'s --umi-len flag; read by write_summary()
+                                        so the report can say whether/how UMI dedup ran without
+                                        threading an extra parameter through every writer call. */
+
+static void umi_dedup(int umi_len) {
+    if (umi_len <= 0) return;
+    int step = paired_mode ? 2 : 1;
+    int n_units = n_reads / step;
+
+    PosKey *keys = xmalloc(sizeof(PosKey) * (size_t)n_units);
+    int n_keys = 0;
+    for (int u = 0; u < n_units; u++) {
+        Read *r = paired_mode ? &reads[2*u] : &reads[u]; /* representative = R1 (or the SE read) */
+        if (!r->aln.mapped || r->aln.n_hits == 0 || r->umi[0] == '\0') continue;
+        Hit *h = &r->aln.hits[0]; /* primary/first-reported hit's position anchors the dedup key,
+                                      same convention real UMI-aware dedup tools use */
+        keys[n_keys].chrom_idx = h->chrom_idx;
+        keys[n_keys].pos = h->ref_start;
+        keys[n_keys].strand = h->strand;
+        keys[n_keys].read_idx = paired_mode ? 2*u : u;
+        n_keys++;
+    }
+    qsort(keys, (size_t)n_keys, sizeof(PosKey), poskey_cmp);
+
+    long dup_count = 0, clustered_extra = 0;
+    UmiBucket *buckets = xmalloc(sizeof(UmiBucket) * MAX_UMIS_PER_POSITION_GROUP);
+    int *order = xmalloc(sizeof(int) * MAX_UMIS_PER_POSITION_GROUP);
+    int *queue = xmalloc(sizeof(int) * MAX_UMIS_PER_POSITION_GROUP);
+
+    int i = 0;
+    while (i < n_keys) {
+        int j = i;
+        while (j < n_keys && poskey_cmp(&keys[j], &keys[i]) == 0) j++;
+
+        /* Bucket this position-group's reads by exact UMI string. Extra
+         * exact-copy reads (a UMI already seen at this position) are
+         * always duplicates of that UMI's first occurrence, independent
+         * of whatever clustering happens below. */
+        int n_buckets = 0, overflow = 0;
+        for (int k = i; k < j; k++) {
+            Read *r = &reads[keys[k].read_idx];
+            int found = -1;
+            for (int b = 0; b < n_buckets; b++) {
+                if (strcmp(buckets[b].umi, r->umi) == 0) { found = b; break; }
+            }
+            if (found >= 0) {
+                buckets[found].count++;
+                reads[keys[k].read_idx].aln.is_duplicate = 1;
+                if (paired_mode) reads[keys[k].read_idx + 1].aln.is_duplicate = 1;
+                dup_count++;
+            } else if (n_buckets < MAX_UMIS_PER_POSITION_GROUP) {
+                strncpy(buckets[n_buckets].umi, r->umi, MAX_UMI_LEN); buckets[n_buckets].umi[MAX_UMI_LEN] = '\0';
+                buckets[n_buckets].count = 1;
+                buckets[n_buckets].first_read_idx = keys[k].read_idx;
+                buckets[n_buckets].cluster = -1;
+                n_buckets++;
+            } else {
+                overflow = 1; /* too many distinct UMIs at this one position -- clustering
+                                  skipped for this group below, exact-match dedup above still
+                                  applies to whatever we did bucket */
+            }
+        }
+
+        if (!overflow && n_buckets > 1) {
+            for (int b = 0; b < n_buckets; b++) order[b] = b;
+            for (int a = 1; a < n_buckets; a++) { /* insertion sort by count desc: n_buckets is
+                                                       small (<=500), so this is cheap and avoids
+                                                       pulling in a second qsort comparator */
+                int tmp = order[a], c = a;
+                while (c > 0 && buckets[order[c-1]].count < buckets[tmp].count) { order[c] = order[c-1]; c--; }
+                order[c] = tmp;
+            }
+            int next_cluster = 0;
+            for (int oi = 0; oi < n_buckets; oi++) {
+                int rep = order[oi];
+                if (buckets[rep].cluster != -1) continue;
+                int cid = next_cluster++;
+                buckets[rep].cluster = cid;
+                int qn = 0, qh = 0;
+                queue[qn++] = rep;
+                while (qh < qn) {
+                    int cur = queue[qh++];
+                    for (int b = 0; b < n_buckets; b++) {
+                        if (buckets[b].cluster != -1) continue;
+                        if (!umi_hamming_le1(buckets[cur].umi, buckets[b].umi, umi_len)) continue;
+                        if (buckets[rep].count >= 2 * buckets[b].count - 1) { /* directional rule,
+                                    thresholded against the cluster's original representative */
+                            buckets[b].cluster = cid;
+                            queue[qn++] = b;
+                        }
+                    }
+                }
+            }
+            for (int cid = 0; cid < next_cluster; cid++) {
+                int best_b = -1;
+                for (int b = 0; b < n_buckets; b++)
+                    if (buckets[b].cluster == cid && (best_b == -1 || buckets[b].count > buckets[best_b].count)) best_b = b;
+                if (best_b == -1) continue;
+                for (int b = 0; b < n_buckets; b++) {
+                    if (buckets[b].cluster != cid || b == best_b) continue;
+                    int idx = buckets[b].first_read_idx;
+                    if (!reads[idx].aln.is_duplicate) {
+                        reads[idx].aln.is_duplicate = 1;
+                        if (paired_mode) reads[idx + 1].aln.is_duplicate = 1;
+                        dup_count++;
+                        clustered_extra++;
+                    }
+                }
+            }
+        }
+        i = j;
+    }
+    free(queue); free(order); free(buckets); free(keys);
+    n_duplicate_units = dup_count;
+    n_duplicate_units_via_clustering = clustered_extra;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Library complexity / saturation curve (Preseq-equivalent QC)           */
+/* ---------------------------------------------------------------------- */
+
+/* Answers the question Preseq's c_curve/lc_extrap exists to answer: if
+ * this library were sequenced deeper, would you keep finding new distinct
+ * molecules, or is it already saturated (most of what's there has already
+ * been seen, and more reads would mostly just be re-reading duplicates)?
+ * Method: take every mapped fragment's (chromosome, alignment position,
+ * strand) -- deliberately *before* any UMI/exact-position deduplication,
+ * matching Preseq's own convention of characterizing raw library
+ * complexity, not post-dedup yield -- shuffle with a fixed seed (so this
+ * report is reproducible run-to-run on the same input, matching this
+ * pipeline's existing determinism), then walk the shuffled list once,
+ * inserting each position into a hash set and recording how many
+ * *distinct* positions have been seen so far at each of ten evenly-spaced
+ * subsample checkpoints (10%, 20%, ..., 100% of all mapped fragments).
+ * A curve still rising steeply near 100% means the library is far from
+ * saturated (deeper sequencing would likely yield substantial new
+ * material); a curve that's flattened out means most of what's there has
+ * already been captured. */
+
+typedef struct { long key; } SatSetSlot; /* open-addressing hash set; UINT64_MAX-as-long
+                                             sentinel marks an empty slot (see note at its use) */
+
+static long sat_hash_key(int chrom_idx, long pos, char strand) {
+    /* chrom_idx: fits comfortably in the high bits (MAX_CHROMS=64 -> 6
+     * bits); pos: established elsewhere in this codebase (SeedHit) that
+     * any real chromosome fits int32_t range; strand: 1 bit. Packed into
+     * a single integer key so a simple open-addressing set (no need to
+     * hash a struct/tuple) can be used. */
+    return ((long)chrom_idx << 33) | ((long)(uint32_t)pos << 1) | (strand == '-' ? 1 : 0);
+}
+
+/* Fisher-Yates shuffle with a fixed seed -- deterministic, not
+ * cryptographic; this is a QC report, not a security-sensitive context,
+ * and determinism (same input -> same report) matters more here than
+ * unpredictability. */
+static void sat_shuffle(long *arr, long n, unsigned long seed) {
+    unsigned long state = seed ? seed : 1;
+    for (long i = n - 1; i > 0; i--) {
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17; /* xorshift64 */
+        long j = (long)(state % (unsigned long)(i + 1));
+        long tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+}
+
+#define SAT_CHECKPOINTS 10
+static long sat_checkpoint_counts[SAT_CHECKPOINTS]; /* distinct positions found using the
+                                                         first 10%,20%,...,100% of shuffled
+                                                         mapped fragments */
+static long sat_total_mapped = 0;
+static long sat_total_distinct = 0;
+static int sat_computed = 0;
+
+static void compute_saturation_curve(void) {
+    sat_computed = 0;
+    for (int i = 0; i < SAT_CHECKPOINTS; i++) sat_checkpoint_counts[i] = 0;
+
+    int step = paired_mode ? 2 : 1;
+    int n_units = n_reads / step;
+    long *keys = xmalloc(sizeof(long) * (size_t)n_units);
+    long n_keys = 0;
+    for (int u = 0; u < n_units; u++) {
+        Read *r = paired_mode ? &reads[2*u] : &reads[u];
+        if (!r->aln.mapped || r->aln.n_hits == 0) continue;
+        Hit *h = &r->aln.hits[0]; /* primary hit position, same convention used for UMI dedup
+                                      and strandedness above */
+        keys[n_keys++] = sat_hash_key(h->chrom_idx, h->ref_start, h->strand);
+    }
+    sat_total_mapped = n_keys;
+    if (n_keys == 0) { free(keys); return; }
+
+    sat_shuffle(keys, n_keys, 0x9E3779B97F4A7C15UL); /* fixed seed: golden-ratio constant,
+                                                          arbitrary but constant across runs */
+
+    /* Open-addressing hash set, sized generously (4x n_keys, next power of
+     * two) to keep collision chains short. */
+    long set_size = 16;
+    while (set_size < n_keys * 4) set_size *= 2;
+    long *set = xmalloc(sizeof(long) * (size_t)set_size);
+    for (long i = 0; i < set_size; i++) set[i] = -1; /* -1: empty slot sentinel. Real keys are
+                                                          always >= 0 (chrom_idx/pos/strand
+                                                          packed from non-negative components),
+                                                          so -1 can never collide with a real
+                                                          key. */
+    long set_mask = set_size - 1;
+    long distinct_so_far = 0;
+    int next_checkpoint = 0;
+
+    for (long i = 0; i < n_keys; i++) {
+        long k = keys[i];
+        long slot = ((unsigned long)k * 2654435761UL) & (unsigned long)set_mask;
+        while (set[slot] != -1 && set[slot] != k) slot = (slot + 1) & set_mask;
+        if (set[slot] == -1) { set[slot] = k; distinct_so_far++; }
+
+        long fragments_so_far = i + 1;
+        while (next_checkpoint < SAT_CHECKPOINTS &&
+               fragments_so_far >= ((next_checkpoint + 1) * n_keys) / SAT_CHECKPOINTS) {
+            sat_checkpoint_counts[next_checkpoint] = distinct_so_far;
+            next_checkpoint++;
+        }
+    }
+    while (next_checkpoint < SAT_CHECKPOINTS) { sat_checkpoint_counts[next_checkpoint] = distinct_so_far; next_checkpoint++; }
+
+    sat_total_distinct = distinct_so_far;
+    sat_computed = 1;
+    free(set); free(keys);
+}
+
+/* ---------------------------------------------------------------------- */
+/* dupRadar-equivalent duplication modeling (independent of UMIs)         */
+/* ---------------------------------------------------------------------- */
+
+/* dupRadar's actual question is different from UMI-tools dedup's: it
+ * doesn't try to identify and remove PCR duplicates precisely (that needs
+ * a UMI, or is a best-effort guess without one) -- it asks whether a
+ * dataset's duplication *pattern* looks like the ordinary, expected kind
+ * (highly-expressed genes rack up more same-position reads than lowly-
+ * expressed ones purely by chance/PCR, so duplication rate should rise
+ * smoothly with expression) or an anomalous kind (genes with unusually
+ * high duplication for their expression level, which usually means a
+ * technical artifact -- degraded input, over-amplification, or a library-
+ * prep bias -- rather than real biological signal). That's answerable
+ * without any UMI at all, using the same Picard MarkDuplicates-style
+ * definition dupRadar's own upstream duplicate-marking step uses:
+ * position-based duplicates (identical chrom + 5' alignment position +
+ * strand), computed here completely independently of --umi-len/UMI-tools-
+ * style dedup above. When --umi-len IS given, that (more precise) UMI-
+ * aware dedup has already run and excluded its duplicates from ever
+ * reaching quantify_em()'s per-gene assignment step below -- so this
+ * analysis, in that case, describes only the residual pattern among
+ * survivors of UMI dedup, not the library's raw duplication rate. That's
+ * a real, stated limitation, not a silent inconsistency: see the
+ * Library complexity section of README.md for the same distinction drawn
+ * around Preseq's saturation curve, which has the identical caveat. */
+
+static unsigned char *g_is_posdup = NULL; /* [unit_idx] -> 1 if this unit's primary hit shares
+                                              (chrom, position, strand) with an earlier-processed
+                                              mapped unit, 0 otherwise (including all unmapped
+                                              units, for which duplication isn't a meaningful
+                                              concept). Sized/filled fresh by
+                                              mark_position_duplicates() on every run. */
+
+static void mark_position_duplicates(void) {
+    int step = paired_mode ? 2 : 1;
+    int n_units = n_reads / step;
+    free(g_is_posdup);
+    g_is_posdup = xmalloc(sizeof(unsigned char) * (size_t)n_units);
+    memset(g_is_posdup, 0, sizeof(unsigned char) * (size_t)n_units);
+
+    /* Open-addressing hash set of (chrom,pos,strand) keys already seen,
+     * reusing sat_hash_key's packing -- same idea as
+     * compute_saturation_curve's set, but walked in original read order
+     * (no shuffle: here we want a stable "first occurrence in the file
+     * is the non-duplicate representative" rule, matching how a real
+     * position-sorted-BAM duplicate marker processes reads front to
+     * back, not a randomized subsampling curve). */
+    long set_size = 16;
+    while (set_size < (long)n_units * 4) set_size *= 2;
+    long *set = xmalloc(sizeof(long) * (size_t)set_size);
+    for (long i = 0; i < set_size; i++) set[i] = -1;
+    long set_mask = set_size - 1;
+
+    for (int u = 0; u < n_units; u++) {
+        Read *r = paired_mode ? &reads[2*u] : &reads[u];
+        if (!r->aln.mapped || r->aln.n_hits == 0) continue;
+        Hit *h = &r->aln.hits[0];
+        long k = sat_hash_key(h->chrom_idx, h->ref_start, h->strand);
+        long slot = ((unsigned long)k * 2654435761UL) & (unsigned long)set_mask;
+        while (set[slot] != -1 && set[slot] != k) slot = (slot + 1) & set_mask;
+        if (set[slot] == -1) { set[slot] = k; g_is_posdup[u] = 0; }
+        else g_is_posdup[u] = 1;
+    }
+    free(set);
+}
+
+#define MAX_DUPRADAR_GENES MAX_GENES
+static long dupr_gene_total[MAX_DUPRADAR_GENES]; /* uniquely-assigned units seen for this gene,
+                                                      duplicate or not (dupRadar's own denominator) */
+static long dupr_gene_dup[MAX_DUPRADAR_GENES];   /* subset of the above flagged a position-duplicate */
+
+static void dupradar_reset(void) {
+    memset(dupr_gene_total, 0, sizeof(dupr_gene_total));
+    memset(dupr_gene_dup, 0, sizeof(dupr_gene_dup));
+}
+
+/* Called from quantify_em()'s Pass 2, once per uniquely-assigned unit
+ * (mirroring record_genebody_position's call site/contract exactly) --
+ * unlike primary quantification, this deliberately counts *duplicate*
+ * units too (that's the entire point: comparing dup vs. non-dup rates
+ * per gene), so it must be called before/independent of any duplicate
+ * exclusion, using g_is_posdup rather than reads[].aln.is_duplicate. */
+static void record_dupradar_unit(int gene_idx, int unit_idx) {
+    if (gene_idx < 0 || gene_idx >= MAX_DUPRADAR_GENES) return;
+    dupr_gene_total[gene_idx]++;
+    if (g_is_posdup && g_is_posdup[unit_idx]) dupr_gene_dup[gene_idx]++;
+}
+
+#define MIN_UNITS_FOR_DUPRADAR 10 /* same threshold/rationale as MIN_READS_FOR_GENEBODY:
+                                      below this a single gene's dup rate is mostly noise */
+
+typedef struct {
+    int    gene_idx;
+    double rpk;        /* reads per kilobase: total_count / (gene length in kb) */
+    double log2_rpk;
+    double dup_rate;   /* dupr_gene_dup / dupr_gene_total */
+} DupradarGene;
+
+/* Collects one row per qualifying gene (>=MIN_UNITS_FOR_DUPRADAR total
+ * units) into *out (caller-allocated, size >= n_genes), sorted by
+ * ascending expression (log2_rpk) -- sorting by expression is what makes
+ * the decile-binned trend table below meaningful (each decile is a
+ * contiguous expression band, not an arbitrary gene-order slice).
+ * Returns the number of qualifying genes written to *out, and, if
+ * pearson_r is non-NULL, the Pearson correlation coefficient between
+ * log2_rpk and dup_rate across exactly those genes (NAN if fewer than 3
+ * genes qualify -- not enough points for a correlation to mean anything). */
+static int compute_dupradar_genes(DupradarGene *out, double *pearson_r) {
+    int n = 0;
+    for (int g = 0; g < n_genes; g++) {
+        if (dupr_gene_total[g] < MIN_UNITS_FOR_DUPRADAR) continue;
+        long gene_len = genes[g].end - genes[g].start + 1;
+        if (gene_len < 1) continue;
+        double rpk = (double)dupr_gene_total[g] / ((double)gene_len / 1000.0);
+        out[n].gene_idx = g;
+        out[n].rpk = rpk;
+        out[n].log2_rpk = log2(rpk + 1.0);
+        out[n].dup_rate = (double)dupr_gene_dup[g] / (double)dupr_gene_total[g];
+        n++;
+    }
+    /* insertion sort by log2_rpk ascending -- n is at most n_genes
+     * (thousands), fine without a qsort comparator/context dance */
+    for (int i = 1; i < n; i++) {
+        DupradarGene key = out[i];
+        int j = i - 1;
+        while (j >= 0 && out[j].log2_rpk > key.log2_rpk) { out[j + 1] = out[j]; j--; }
+        out[j + 1] = key;
+    }
+    if (pearson_r) {
+        if (n < 3) { *pearson_r = NAN; }
+        else {
+            double mx = 0, my = 0;
+            for (int i = 0; i < n; i++) { mx += out[i].log2_rpk; my += out[i].dup_rate; }
+            mx /= n; my /= n;
+            double sxy = 0, sxx = 0, syy = 0;
+            for (int i = 0; i < n; i++) {
+                double dx = out[i].log2_rpk - mx, dy = out[i].dup_rate - my;
+                sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+            }
+            *pearson_r = (sxx > 0 && syy > 0) ? sxy / sqrt(sxx * syy) : NAN;
+        }
+    }
+    return n;
+}
+
+static void write_dupradar_tsv(const char *outdir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/dupradar.tsv", outdir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "gene_id\ttotal_count\tdup_count\tdup_rate\trpk\tlog2_rpk\n");
+    DupradarGene *rows = xmalloc(sizeof(DupradarGene) * (size_t)(n_genes > 0 ? n_genes : 1));
+    int n = compute_dupradar_genes(rows, NULL);
+    for (int i = 0; i < n; i++) {
+        int g = rows[i].gene_idx;
+        fprintf(f, "%s\t%ld\t%ld\t%.4f\t%.3f\t%.3f\n",
+                genes[g].gene_id, dupr_gene_total[g], dupr_gene_dup[g],
+                rows[i].dup_rate, rows[i].rpk, rows[i].log2_rpk);
+    }
+    free(rows);
+    fclose(f);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Junction annotation (RSeQC-equivalent: known vs. novel splice sites)   */
+/* ---------------------------------------------------------------------- */
+
+/* RSeQC's junction_annotation.py classifies every splice junction it sees
+ * in the BAM against the reference gene model into three buckets:
+ *   - known:          both splice sites match an annotated exon-exon
+ *                      junction, AND as the same pair (not just each site
+ *                      independently annotated as part of some *other*
+ *                      junction)
+ *   - partial novel:  one splice site matches an annotated donor or
+ *                      acceptor position (from any transcript), but paired
+ *                      with a site that doesn't -- e.g. a real annotated
+ *                      5' splice site spliced to an unannotated 3' site,
+ *                      which happens with alternative splicing that isn't
+ *                      in the reference gene model yet
+ *   - complete novel: neither site matches anything annotated
+ * reported both per splicing *event* (one per spliced read/alignment) and
+ * per distinct splicing *junction* (one per unique chrom+donor+acceptor,
+ * however many reads support it). This mirrors that exactly, built from
+ * the "exon" rows already present in the input GTF (no extra annotation
+ * file needed) and the spliced alignments this pipeline's own
+ * splice-anchor seeding already finds (see try_spliced_align above) --
+ * nothing here changes what gets aligned or counted, purely additive QC. */
+
+typedef struct { char transcript_id[128]; int chrom_idx; long start; long end; } ExonRec;
+static ExonRec *g_exons = NULL;
+static long g_n_exons = 0, g_exons_cap = 0;
+
+static void exon_push(const char *tid, int chrom_idx, long start, long end) {
+    if (g_n_exons >= g_exons_cap) {
+        g_exons_cap = g_exons_cap ? g_exons_cap * 2 : 4096;
+        g_exons = xrealloc(g_exons, sizeof(ExonRec) * (size_t)g_exons_cap);
+    }
+    ExonRec *e = &g_exons[g_n_exons++];
+    strncpy(e->transcript_id, tid, sizeof(e->transcript_id) - 1);
+    e->transcript_id[sizeof(e->transcript_id) - 1] = '\0';
+    e->chrom_idx = chrom_idx; e->start = start; e->end = end;
+}
+
+static int find_chrom_idx(const char *name) {
+    for (int i = 0; i < n_chroms; i++) if (strcmp(chroms[i].name, name) == 0) return i;
+    return -1;
+}
+
+static int exon_cmp(const void *a, const void *b) {
+    const ExonRec *ea = a, *eb = b;
+    int c = strcmp(ea->transcript_id, eb->transcript_id);
+    if (c) return c;
+    if (ea->start != eb->start) return ea->start < eb->start ? -1 : 1;
+    return 0;
+}
+
+/* Small open-addressing hash sets, same collision strategy as
+ * mark_position_duplicates()'s above -- separate instantiations (rather
+ * than a shared generic type) because that one is sized/reused per-run
+ * from n_units while these are sized once from exon count and read many
+ * times per spliced alignment during quantify_em(). */
+static long *g_known_junc_set = NULL, g_known_junc_mask = 0;
+static long *g_known_donor_set = NULL, g_known_donor_mask = 0;
+static long *g_known_acceptor_set = NULL, g_known_acceptor_mask = 0;
+static long g_n_known_junctions = 0;
+
+static void hashset_alloc(long **set, long *mask, long min_entries) {
+    long sz = 16;
+    while (sz < min_entries * 4) sz *= 2;
+    *set = xmalloc(sizeof(long) * (size_t)sz);
+    for (long i = 0; i < sz; i++) (*set)[i] = -1;
+    *mask = sz - 1;
+}
+
+/* Returns 1 if `key` was newly inserted, 0 if it was already present
+ * (callers use this to count distinct entries without a second pass). */
+static int hashset_insert(long *set, long mask, long key) {
+    long slot = ((unsigned long)key * 2654435761UL) & (unsigned long)mask;
+    while (set[slot] != -1 && set[slot] != key) slot = (slot + 1) & mask;
+    if (set[slot] == key) return 0;
+    set[slot] = key;
+    return 1;
+}
+
+static int hashset_contains(long *set, long mask, long key) {
+    if (!set) return 0;
+    long slot = ((unsigned long)key * 2654435761UL) & (unsigned long)mask;
+    while (set[slot] != -1) { if (set[slot] == key) return 1; slot = (slot + 1) & mask; }
+    return 0;
+}
+
+/* A full (chrom,donor,acceptor) junction needs 3 fields packed into one
+ * key; donor/acceptor-only site sets reuse sat_hash_key(chrom,pos,'+')
+ * directly (the dummy '+' just occupies the strand bit -- splice sites
+ * aren't stranded in this classification, unlike the read-position
+ * duplicate keys sat_hash_key was designed for). */
+static long junc_key3(int chrom_idx, long donor, long acceptor) {
+    return sat_hash_key(chrom_idx, donor, '+') * 1000003L + (long)(uint32_t)acceptor;
+}
+
+/* Parses "exon" rows directly from the GTF a second time (load_gtf()
+ * above only keeps min/max span per gene, not per-transcript exon
+ * boundaries -- deliberately not touched here, to avoid any risk to the
+ * gene-quantification path this whole pipeline's correctness already
+ * depends on). Non-fatal on any failure: junction annotation is
+ * additive QC, not something the rest of the pipeline needs to run. */
+static void load_known_junctions(const char *gtf_path) {
+    int is_pipe;
+    FILE *f = open_maybe_gz(gtf_path, &is_pipe);
+    if (!f) return;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        rstrip(line);
+        if (line[0] == '#' || line[0] == '\0') continue;
+        char chrom[MAX_SEQNAME], source[64], feature[64], strand_s[8], frame_s[8], attrs[MAX_LINE];
+        long start, end; char score_s[16];
+        int n = sscanf(line, "%127s\t%63s\t%63s\t%ld\t%ld\t%15s\t%7s\t%7s\t%[^\n]",
+                        chrom, source, feature, &start, &end, score_s, strand_s, frame_s, attrs);
+        if (n < 9 || strcmp(feature, "exon") != 0) continue;
+        char tid[128];
+        extract_attr(attrs, "transcript_id", tid, sizeof(tid));
+        if (tid[0] == '\0') continue;
+        int ci = find_chrom_idx(chrom);
+        if (ci < 0) continue; /* GTF references a chrom not in the FASTA -- skip, don't die */
+        exon_push(tid, ci, start, end);
+    }
+    close_maybe_gz(f, is_pipe);
+    if (g_n_exons == 0) return;
+    qsort(g_exons, (size_t)g_n_exons, sizeof(ExonRec), exon_cmp);
+
+    hashset_alloc(&g_known_junc_set, &g_known_junc_mask, g_n_exons + 16);
+    hashset_alloc(&g_known_donor_set, &g_known_donor_mask, g_n_exons + 16);
+    hashset_alloc(&g_known_acceptor_set, &g_known_acceptor_mask, g_n_exons + 16);
+
+    for (long i = 0; i + 1 < g_n_exons; i++) {
+        if (strcmp(g_exons[i].transcript_id, g_exons[i + 1].transcript_id) != 0) continue;
+        if (g_exons[i].chrom_idx != g_exons[i + 1].chrom_idx) continue;
+        /* GTF exon coords are 1-based inclusive; the aligner's donor_pos/
+         * acceptor_end (see try_spliced_align) are 0-based with donor_pos
+         * = first intron base, acceptor_end = first base of the next exon.
+         * exon[i].end (1-based) numerically equals donor_pos (0-based) --
+         * the two off-by-one conversions cancel -- and exon[i+1].start-1
+         * (1-based start minus one) equals acceptor_end (0-based). */
+        long donor = g_exons[i].end;
+        long acceptor = g_exons[i + 1].start - 1;
+        if (acceptor <= donor) continue; /* overlapping/adjacent rows, not a real intron */
+        long jk = junc_key3(g_exons[i].chrom_idx, donor, acceptor);
+        if (hashset_insert(g_known_junc_set, g_known_junc_mask, jk)) g_n_known_junctions++;
+        hashset_insert(g_known_donor_set, g_known_donor_mask, sat_hash_key(g_exons[i].chrom_idx, donor, '+'));
+        hashset_insert(g_known_acceptor_set, g_known_acceptor_mask, sat_hash_key(g_exons[i].chrom_idx, acceptor, '+'));
+    }
+    free(g_exons); g_exons = NULL; g_n_exons = 0; g_exons_cap = 0;
+}
+
+typedef enum { JUNC_KNOWN, JUNC_PARTIAL_NOVEL, JUNC_COMPLETE_NOVEL } JuncCategory;
+
+static long junc_events[3] = {0, 0, 0};   /* per spliced alignment (one per spliced read) */
+static long junc_unique[3] = {0, 0, 0};   /* per distinct (chrom,donor,acceptor), first-seen only */
+static long *g_observed_junc_set = NULL;
+static long g_observed_junc_mask = 0;
+
+#define MAX_JUNCTION_ROWS 200000
+typedef struct { int chrom_idx; long donor; long acceptor; JuncCategory cat; long n_events; } JuncRow;
+static JuncRow junc_rows[MAX_JUNCTION_ROWS];
+static long n_junc_rows = 0;
+
+static void junctions_reset(int n_units_hint) {
+    long m = n_units_hint > 1024 ? n_units_hint : 1024;
+    if (!g_observed_junc_set) hashset_alloc(&g_observed_junc_set, &g_observed_junc_mask, m);
+    memset(junc_events, 0, sizeof(junc_events));
+    memset(junc_unique, 0, sizeof(junc_unique));
+    n_junc_rows = 0;
+}
+
+/* Called once per mapped unit from quantify_em()'s Pass 2, regardless of
+ * gene-assignment outcome (known/novel splice-site usage is a property of
+ * the alignment, not of whether it landed on exactly one gene) -- a no-op
+ * for the large majority of units, which aren't spliced at all. */
+static void record_junction_event(const Read *rep) {
+    if (!rep->aln.mapped || rep->aln.n_hits == 0) return;
+    const Hit *h = &rep->aln.hits[0];
+    if (!h->spliced || h->n_cigar < 1) return;
+    long donor = h->ref_start + h->cigar[0].len;
+    long acceptor = donor + h->intron_len;
+
+    int known_pair = hashset_contains(g_known_junc_set, g_known_junc_mask,
+                                       junc_key3(h->chrom_idx, donor, acceptor));
+    JuncCategory cat;
+    if (known_pair) cat = JUNC_KNOWN;
+    else {
+        int donor_known = hashset_contains(g_known_donor_set, g_known_donor_mask,
+                                            sat_hash_key(h->chrom_idx, donor, '+'));
+        int acceptor_known = hashset_contains(g_known_acceptor_set, g_known_acceptor_mask,
+                                               sat_hash_key(h->chrom_idx, acceptor, '+'));
+        cat = (donor_known || acceptor_known) ? JUNC_PARTIAL_NOVEL : JUNC_COMPLETE_NOVEL;
+    }
+    junc_events[cat]++;
+
+    long ok = junc_key3(h->chrom_idx, donor, acceptor);
+    if (hashset_insert(g_observed_junc_set, g_observed_junc_mask, ok)) {
+        junc_unique[cat]++;
+        if (n_junc_rows < MAX_JUNCTION_ROWS) {
+            JuncRow *r = &junc_rows[n_junc_rows++];
+            r->chrom_idx = h->chrom_idx; r->donor = donor; r->acceptor = acceptor; r->cat = cat; r->n_events = 1;
+        }
+    } else if (n_junc_rows > 0) {
+        /* find and bump the existing row's event count -- linear scan is
+         * fine here: distinct junctions are typically a small fraction of
+         * total spliced reads (most support is concentrated on a modest
+         * number of real junctions), and this only runs on the rarer
+         * repeat-observation path, not on every spliced read */
+        for (long i = n_junc_rows - 1; i >= 0; i--) {
+            if (junc_rows[i].chrom_idx == h->chrom_idx && junc_rows[i].donor == donor && junc_rows[i].acceptor == acceptor) {
+                junc_rows[i].n_events++;
+                break;
+            }
+        }
+    }
+}
+
+static void write_junctions_tsv(const char *outdir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/junctions.tsv", outdir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "chrom\tintron_start_1based\tintron_end_1based\tcategory\tn_supporting_reads\n");
+    const char *names[3] = {"known", "partial_novel", "complete_novel"};
+    for (long i = 0; i < n_junc_rows; i++) {
+        JuncRow *r = &junc_rows[i];
+        fprintf(f, "%s\t%ld\t%ld\t%s\t%ld\n", chroms[r->chrom_idx].name,
+                r->donor + 1, r->acceptor, names[r->cat], r->n_events);
+    }
+    fclose(f);
+}
+
+/* Per-gene, 100-bin histogram of where uniquely-assigned reads land along
+ * the gene body, 0 = the gene's 5' end and 99 = its 3' end (already
+ * strand-corrected at record time, so this is always "biological" 5'->3',
+ * not genomic left->right). Aggregated across qualifying genes at report
+ * time into one genome-wide curve -- the standard way to check for 5'/3'
+ * coverage bias (e.g. from RNA degradation, or 3' bias from polyA-selected
+ * library prep), the same question RSeQC's geneBody_coverage.py answers. */
+#define GENEBODY_BINS 100
+static unsigned int (*genebody_hist)[GENEBODY_BINS] = NULL; /* [gene_idx][bin], allocated once
+                                                                 n_genes is known */
+
+static void genebody_hist_alloc(void) {
+    if (genebody_hist) return;
+    genebody_hist = xmalloc(sizeof(unsigned int[GENEBODY_BINS]) * (size_t)MAX_GENES);
+    memset(genebody_hist, 0, sizeof(unsigned int[GENEBODY_BINS]) * (size_t)MAX_GENES);
+}
+
+/* Records one uniquely-assigned read/fragment's position within its gene.
+ * Uses the representative (R1, or the SE read)'s primary hit midpoint as
+ * the read's position -- a reasonable single-point summary for a 150bp
+ * read against genes that are typically much longer; doesn't attempt to
+ * spread partial credit across a read's full footprint. */
+static void record_genebody_position(int gene_idx, const Read *rep) {
+    if (!genebody_hist) return;
+    if (!rep->aln.mapped || rep->aln.n_hits == 0) return;
+    const Gene *g = &genes[gene_idx];
+    long gene_len = g->end - g->start + 1;
+    if (gene_len < 200) return; /* too short for 100 bins to mean much; matches RSeQC's own
+                                    practice of excluding very short transcripts from this QC */
+    const Hit *h = &rep->aln.hits[0];
+    long mid = h->ref_start + 1; /* ref_start is 0-based; +1 -> 1-based to match g->start/end,
+                                     then treat as the read's representative single position
+                                     (start of the alignment, not adjusted for read length --
+                                     fine at this bin resolution) */
+    double frac = (double)(mid - g->start) / (double)gene_len;
+    if (frac < 0.0) frac = 0.0; if (frac > 0.999999) frac = 0.999999;
+    int bin = (int)(frac * GENEBODY_BINS);
+    if (g->strand == '-') bin = GENEBODY_BINS - 1 - bin; /* flip so 0 is always the
+                                                              biological 5' end */
+    if (bin < 0) bin = 0; if (bin >= GENEBODY_BINS) bin = GENEBODY_BINS - 1;
+    #pragma omp atomic
+    genebody_hist[gene_idx][bin]++;
+}
+
+/* Aggregates the per-gene histograms into one genome-wide curve, weighting
+ * every qualifying gene equally (each gene's own histogram is normalized
+ * to sum to 1 before averaging) so a handful of very highly expressed
+ * genes don't dominate the result -- the same approach RSeQC uses.
+ * Requires at least MIN_READS_FOR_GENEBODY unique reads on a gene to
+ * include it (too few reads make a single gene's 100-bin curve mostly
+ * noise). out_curve[100] receives the averaged, normalized curve;
+ * returns the number of genes that qualified and were included. */
+#define MIN_READS_FOR_GENEBODY 10
+static int aggregate_genebody_coverage(double out_curve[GENEBODY_BINS]) {
+    for (int b = 0; b < GENEBODY_BINS; b++) out_curve[b] = 0.0;
+    if (!genebody_hist) return 0;
+    int n_qualifying = 0;
+    for (int i = 0; i < n_genes; i++) {
+        unsigned long total = 0;
+        for (int b = 0; b < GENEBODY_BINS; b++) total += genebody_hist[i][b];
+        if (total < MIN_READS_FOR_GENEBODY) continue;
+        n_qualifying++;
+        for (int b = 0; b < GENEBODY_BINS; b++) out_curve[b] += (double)genebody_hist[i][b] / (double)total;
+    }
+    if (n_qualifying > 0) for (int b = 0; b < GENEBODY_BINS; b++) out_curve[b] /= n_qualifying;
+    return n_qualifying;
+}
+
 static void quantify_em(void) {
+    last_strand_resolved_units = 0;
+    mark_position_duplicates();
+    dupradar_reset();
+    junctions_reset(paired_mode ? n_reads / 2 : n_reads);
     int step = paired_mode ? 2 : 1;
     int n_units = n_reads / step;
 
@@ -1549,13 +3761,104 @@ static void quantify_em(void) {
     int n_multi = 0;
 
     n_unique_units = n_multi_units = n_no_feature_units = n_unmapped_units = 0;
+
+    /* --- Pass 1: strandedness diagnostic, computed BEFORE any strand-based
+     * filtering so it stays an unbiased read of the raw, strand-agnostic
+     * overlap assignment (RSeQC infer_experiment.py-style): among
+     * fragments/reads unambiguously assigned to exactly one gene by
+     * position alone, compare read 1's alignment strand to that gene's
+     * annotated strand. This determines the protocol verdict used by pass 2
+     * below, and is also what's printed to stdout/multiqc_summary.txt. */
+    long n_dup_units_excluded = 0;
+    long strand_concordant = 0, strand_discordant = 0;
     for (int u = 0; u < n_units; u++) {
+        Read *rep = paired_mode ? &reads[2*u] : &reads[u];
+        if (rep->aln.is_duplicate) continue;
+        if (!unit_mapped[u] || unit_cand[u].n != 1) continue;
+        Read *sense_read = paired_mode ? &reads[2*u] : &reads[u];
+        if (sense_read->aln.mapped && sense_read->aln.n_hits > 0) {
+            char rstrand = sense_read->aln.hits[0].strand;
+            char gstrand = genes[unit_cand[u].idx[0]].strand;
+            if (rstrand == gstrand) strand_concordant++; else strand_discordant++;
+        }
+    }
+    last_strand_concordant = strand_concordant;
+    last_strand_discordant = strand_discordant;
+
+    /* --- Strand-aware disambiguation for genuinely ambiguous (multi-gene)
+     * units, gated on the pass-1 verdict being confidently one-directional
+     * (same >=80%/<=20% threshold classify_strandedness() uses to call a
+     * protocol "stranded" at all -- below that, filtering would be acting
+     * on noise). Deliberately conservative: a read/fragment's candidate set
+     * is only ever narrowed, never expanded or zeroed. If filtering by the
+     * expected strand relationship would eliminate every candidate (e.g. an
+     * occasional genuinely-antisense read in a mostly-stranded library),
+     * the original, unfiltered candidate set is kept instead of forcing a
+     * possibly-wrong call -- this only helps when it has real signal to
+     * work with (multiple overlapping genes on opposite strands, one of
+     * which matches the read's implied sense strand), never as a way to
+     * discard otherwise-valid overlap-based assignments. This is what
+     * turns the strandedness check from purely diagnostic (as it was
+     * before this pass) into something that can actually improve
+     * quantification specificity in regions with antisense/overlapping
+     * gene annotations -- see "On strandedness and gene assignment" in
+     * README.md for the previously-open gap this closes, and its
+     * remaining limits (still only resolves ties among *already-detected*
+     * overlapping genes; doesn't add strand-aware alignment or change
+     * single-candidate assignments). */
+    {
+        long total = strand_concordant + strand_discordant;
+        if (total >= 100) {
+            double frac_concordant = (double)strand_concordant / (double)total;
+            int want_concordant = -1; /* -1 = not confidently stranded, don't filter */
+            if (frac_concordant >= 0.8) want_concordant = 1;      /* forward-stranded: keep read1==gene strand */
+            else if (frac_concordant <= 0.2) want_concordant = 0; /* reverse-stranded: keep read1!=gene strand */
+
+            if (want_concordant != -1) {
+                long n_resolved = 0;
+                for (int u = 0; u < n_units; u++) {
+                    if (unit_cand[u].n <= 1) continue; /* nothing ambiguous to resolve */
+                    Read *sense_read = paired_mode ? &reads[2*u] : &reads[u];
+                    if (!sense_read->aln.mapped || sense_read->aln.n_hits == 0) continue;
+                    char rstrand = sense_read->aln.hits[0].strand;
+
+                    GeneSet filtered; filtered.n = 0;
+                    for (int i = 0; i < unit_cand[u].n; i++) {
+                        int is_concordant = (rstrand == genes[unit_cand[u].idx[i]].strand);
+                        if ((is_concordant ? 1 : 0) == want_concordant) geneset_add(&filtered, unit_cand[u].idx[i]);
+                    }
+                    if (filtered.n > 0 && filtered.n < unit_cand[u].n) {
+                        unit_cand[u] = filtered;
+                        if (paired_mode) { reads[2*u].candidates = filtered; reads[2*u+1].candidates = filtered; }
+                        else reads[u].candidates = filtered;
+                        n_resolved++;
+                    }
+                    /* filtered.n == 0 or == unit_cand[u].n: no useful signal here, keep original */
+                }
+                last_strand_resolved_units = n_resolved;
+            }
+        }
+    }
+
+    /* --- Pass 2: final unmapped/no-feature/unique/multi classification and
+     * counting, using unit_cand as it now stands after any strand-based
+     * narrowing above (a no-op for unstranded libraries or libraries below
+     * the confidence threshold -- unit_cand is untouched in that case). */
+    for (int u = 0; u < n_units; u++) {
+        Read *rep = paired_mode ? &reads[2*u] : &reads[u];
+        if (rep->aln.is_duplicate) { n_dup_units_excluded++; continue; } /* UMI-marked PCR/optical
+                                        duplicate: excluded from counting entirely (not tallied as
+                                        unmapped/no-feature/unique/multi), tracked separately in
+                                        n_duplicate_units below and reported in the QC summary. */
         if (!unit_mapped[u]) { n_unmapped_units++; continue; }
+        record_junction_event(rep);
         if (unit_cand[u].n == 0) { n_no_feature_units++; continue; }
         if (unit_cand[u].n == 1) {
             unique_count[unit_cand[u].idx[0]] += 1.0;
             gene_in_use[unit_cand[u].idx[0]] = 1;
             n_unique_units++;
+            record_genebody_position(unit_cand[u].idx[0], rep);
+            record_dupradar_unit(unit_cand[u].idx[0], u);
         } else {
             for (int i = 0; i < unit_cand[u].n; i++) gene_in_use[unit_cand[u].idx[i]] = 1;
             multi_units[n_multi++] = u;
@@ -1623,6 +3926,7 @@ static void quantify_em(void) {
         }
     }
     for (int g = 0; g < n_genes; g++) genes[g].unique_count = (long)llround(unique_count[g]);
+    n_duplicate_units = n_dup_units_excluded;
 
     free(unit_cand); free(unit_mapped); free(unique_count); free(gene_in_use);
     free(multi_units); free(theta); free(new_theta);
@@ -1680,6 +3984,7 @@ static void write_sam_record_se(FILE *f, const Read *r) {
         const Hit *h = &r->aln.hits[i];
         int flag = (h->strand == '-') ? 0x10 : 0;
         if (i > 0) flag |= 0x100; /* secondary alignment */
+        if (r->aln.is_duplicate) flag |= 0x400;
         char cigar[256];
         format_cigar(h, cigar, sizeof(cigar));
         fprintf(f, "%s\t%d\t%s\t%ld\t%d\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\tNH:i:%d\tXG:Z:%s%s\n",
@@ -1701,6 +4006,7 @@ static void write_sam_record_pe(FILE *f, const Read *r, const Read *mate) {
     if (is_proper_pair(r, mate)) flag |= 0x2;
     if (!mate->aln.mapped) flag |= 0x8;
     else if (mate->aln.hits[0].strand == '-') flag |= 0x20;
+    if (r->aln.is_duplicate) flag |= 0x400;
 
     if (!r->aln.mapped) {
         flag |= 0x4;
@@ -1748,6 +4054,164 @@ static void write_sam(const char *outdir) {
         else write_sam_record_pe(f, r, &reads[r->mate_idx]);
     }
     fclose(f);
+}
+
+/* nf-core/rnaseq (like essentially every real RNA-seq pipeline) doesn't
+ * reimplement BAM sorting/indexing itself -- it shells out to `samtools
+ * sort`/`samtools index`, because that's the correct, battle-tested tool
+ * for the job. This does the same: if `samtools` is on PATH, coordinate-sort
+ * and index the SAM this run just produced into a real, standard
+ * .sorted.bam + .bai pair. If samtools isn't available, this is skipped
+ * with a clear message rather than failing the run -- the pipeline itself
+ * still has no *build*-time dependency beyond libc/libm; this is an
+ * optional runtime convenience when samtools happens to be present. */
+static void try_write_sorted_bam(const char *outdir) {
+    if (system("command -v samtools > /dev/null 2>&1") != 0) {
+        printf("      note: samtools not found on PATH -- skipping sorted/indexed BAM output\n");
+        printf("            (alignments.sam is still written; install samtools and re-run\n");
+        printf("             `samtools sort -o alignments.sorted.bam alignments.sam && samtools index alignments.sorted.bam`\n");
+        printf("             yourself to get one)\n");
+        return;
+    }
+    char sam_path[1040], bam_path[1040], cmd[2200];
+    snprintf(sam_path, sizeof(sam_path), "%s/alignments.sam", outdir);
+    snprintf(bam_path, sizeof(bam_path), "%s/alignments.sorted.bam", outdir);
+    /* -m 256M -@ 1: deliberately conservative. samtools sort's default
+     * per-thread memory (768M) stacks on top of whatever this pipeline's
+     * own process is still holding resident (k-mer index + reads[] array)
+     * at this point in the run -- on a memory-constrained box that
+     * combination OOM-killed the whole run during production validation
+     * (found on a 4GB sandbox running the full 1M-read-pair S. cerevisiae
+     * set). 256M/1 thread trades sort speed for not taking down the run;
+     * raise both if you know you have RAM to spare. */
+    snprintf(cmd, sizeof(cmd), "samtools sort -m 256M -@ 1 -o '%s' '%s' 2>&1 && samtools index '%s' 2>&1",
+             bam_path, sam_path, bam_path);
+    printf("      sorting + indexing BAM via samtools...\n");
+    int rc = system(cmd);
+    if (rc == 0) {
+        printf("      -> wrote %s (+ .bai index)\n", bam_path);
+    } else {
+        printf("      WARNING: samtools sort/index failed (exit %d) -- alignments.sam is still valid,\n", rc);
+        printf("               sorted/indexed BAM was not produced this run\n");
+    }
+}
+
+/* Embedded as a string and written to a temp .py file at run time rather
+ * than shipped as a second file, so the "single C file" property of this
+ * repo still holds -- the only thing that changes is what gets shelled out
+ * to, same as the samtools step above. Converts a bedGraph (from `bedtools
+ * genomecov`) into a real, standard bigWig file via pyBigWig, which writes
+ * the actual UCSC binary bigWig format (R-tree index, zoom levels, the
+ * works) -- this is not a bedGraph renamed with a .bw extension. */
+static const char *BG2BW_PY =
+"import sys, pyBigWig\n"
+"bg_path, chrom_sizes_path, bw_path = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+"chroms = []\n"
+"with open(chrom_sizes_path) as f:\n"
+"    for line in f:\n"
+"        name, size = line.split()\n"
+"        chroms.append((name, int(size)))\n"
+"bw = pyBigWig.open(bw_path, 'w')\n"
+"bw.addHeader(chroms)\n"
+"cur_chrom = None\n"
+"starts, ends, vals = [], [], []\n"
+"def flush():\n"
+"    global starts, ends, vals\n"
+"    if starts:\n"
+"        bw.addEntries([cur_chrom]*len(starts), starts, ends=ends, values=vals)\n"
+"    starts, ends, vals = [], [], []\n"
+"with open(bg_path) as f:\n"
+"    for line in f:\n"
+"        chrom, start, end, val = line.split()\n"
+"        if chrom != cur_chrom:\n"
+"            flush()\n"
+"            cur_chrom = chrom\n"
+"        starts.append(int(start)); ends.append(int(end)); vals.append(float(val))\n"
+"        if len(starts) >= 100000:\n"
+"            flush()\n"
+"flush()\n"
+"bw.close()\n";
+
+/* nf-core/rnaseq produces bigWig coverage tracks via `bedtools genomecov` +
+ * `bedGraphToBigWig` (a UCSC tool). This does the equivalent, substituting
+ * pyBigWig (a widely-packaged Python binding to the same underlying
+ * libBigWig C library UCSC's own tool uses) for the bedGraph->bigWig
+ * conversion step, since that's what's reliably apt-installable rather
+ * than the UCSC binary specifically. Requires `bedtools` on PATH and a
+ * `python3` with `pyBigWig` importable; skips gracefully (leaving the
+ * plain bedGraph, which IGV/UCSC can already load directly) if either is
+ * missing. Only attempted if the sorted BAM step above actually produced
+ * a BAM to read coverage from. */
+static void try_write_bigwig(const char *outdir) {
+    char bam_path[1040];
+    snprintf(bam_path, sizeof(bam_path), "%s/alignments.sorted.bam", outdir);
+    FILE *chk = fopen(bam_path, "rb");
+    if (!chk) {
+        printf("      note: no sorted BAM available -- skipping coverage track (bigWig/bedGraph)\n");
+        return;
+    }
+    fclose(chk);
+
+    if (system("command -v bedtools > /dev/null 2>&1") != 0) {
+        printf("      note: bedtools not found on PATH -- skipping coverage track (bigWig/bedGraph)\n");
+        return;
+    }
+
+    char bg_path[1040], cmd[2200];
+    snprintf(bg_path, sizeof(bg_path), "%s/coverage.bedgraph", outdir);
+    snprintf(cmd, sizeof(cmd), "bedtools genomecov -bga -ibam '%s' > '%s' 2>%s/.genomecov.err",
+             bam_path, bg_path, outdir);
+    printf("      computing genome coverage (bedtools genomecov)...\n");
+    if (system(cmd) != 0) {
+        printf("      WARNING: bedtools genomecov failed -- no coverage track produced this run\n");
+        return;
+    }
+    printf("      -> wrote %s\n", bg_path);
+
+    if (system("python3 -c 'import pyBigWig' > /dev/null 2>&1") != 0) {
+        printf("      note: python3 pyBigWig not available -- leaving coverage as bedGraph\n");
+        printf("            (still directly loadable in IGV/UCSC Genome Browser; install\n");
+        printf("             pyBigWig, or run `bedGraphToBigWig` yourself, for a .bw)\n");
+        return;
+    }
+
+    /* chrom.sizes: written directly from the in-memory chroms[] table --
+     * no need to shell out or re-parse a BAM header for data we already
+     * have. */
+    char sizes_path[1040];
+    snprintf(sizes_path, sizeof(sizes_path), "%s/chrom.sizes", outdir);
+    FILE *sf = fopen(sizes_path, "w");
+    if (!sf) { printf("      WARNING: cannot write chrom.sizes -- leaving coverage as bedGraph\n"); return; }
+    for (int i = 0; i < n_chroms; i++) fprintf(sf, "%s\t%ld\n", chroms[i].name, chroms[i].len);
+    fclose(sf);
+
+    char py_path[1040];
+    snprintf(py_path, sizeof(py_path), "%s/.bg2bw_tmp.py", outdir);
+    FILE *pf = fopen(py_path, "w");
+    if (!pf) { printf("      WARNING: cannot write conversion script -- leaving coverage as bedGraph\n"); return; }
+    fputs(BG2BW_PY, pf);
+    fclose(pf);
+
+    char bw_path[1040];
+    snprintf(bw_path, sizeof(bw_path), "%s/coverage.bw", outdir);
+    snprintf(cmd, sizeof(cmd), "python3 '%s' '%s' '%s' '%s' 2>%s/.bg2bw.err",
+             py_path, bg_path, sizes_path, bw_path, outdir);
+    printf("      converting bedGraph -> bigWig (pyBigWig)...\n");
+    int rc = system(cmd);
+    remove(py_path);
+    if (rc == 0) {
+        printf("      -> wrote %s\n", bw_path);
+    } else {
+        printf("      WARNING: bedGraph->bigWig conversion failed -- leaving coverage as bedGraph\n");
+    }
+    /* Clean up empty stderr capture files from the shell-outs above so a
+     * successful run doesn't leave clutter in outdir. */
+    char err1[1072], err2[1072];
+    snprintf(err1, sizeof(err1), "%s/.genomecov.err", outdir);
+    snprintf(err2, sizeof(err2), "%s/.bg2bw.err", outdir);
+    struct stat st;
+    if (stat(err1, &st) == 0 && st.st_size == 0) remove(err1);
+    if (stat(err2, &st) == 0 && st.st_size == 0) remove(err2);
 }
 
 static void write_gene_counts(const char *outdir) {
@@ -1991,6 +4455,115 @@ static void write_html_report(const char *outdir, const char *reads_desc) {
         }
     }
 
+    /* --- Gene-body coverage (RSeQC geneBody_coverage.py-equivalent) --- */
+    {
+        double curve[GENEBODY_BINS];
+        int n_qual = aggregate_genebody_coverage(curve);
+        if (n_qual > 0) {
+            double scaled[GENEBODY_BINS];
+            for (int b = 0; b < GENEBODY_BINS; b++) scaled[b] = curve[b] * 1000.0; /* scale up for
+                                                        a readable y-axis; svg_line_chart expects
+                                                        y_min/y_max hints in the same units */
+            double ymax = 0; for (int b = 0; b < GENEBODY_BINS; b++) if (scaled[b] > ymax) ymax = scaled[b];
+            fprintf(f, "<h2>Gene-body coverage</h2>\n<div class=\"card\">\n");
+            svg_line_chart(f, scaled, GENEBODY_BINS, 0, ymax * 1.15, "#8a4fd6");
+            fprintf(f, "</div>\n<p class=\"note\">X axis: position along gene body, 0%% = 5' end, 100%% = 3' end "
+                       "(strand-corrected). Y axis: relative read density, averaged across %d genes with "
+                       "&ge;%d uniquely-assigned reads each, each gene's own curve normalized to sum to 1 "
+                       "before averaging so highly-expressed genes don't dominate the shape. Analogous to "
+                       "RSeQC's geneBody_coverage.py plot -- a flat curve indicates uniform coverage; a "
+                       "skew toward either end can indicate RNA degradation (3' skew) or other library-prep "
+                       "biases.</p>\n", n_qual, MIN_READS_FOR_GENEBODY);
+        }
+    }
+
+    /* --- Library complexity / saturation curve (Preseq-equivalent) ---- */
+    if (sat_computed && sat_total_mapped > 0) {
+        double scaled[SAT_CHECKPOINTS];
+        double ymax = 0;
+        for (int i = 0; i < SAT_CHECKPOINTS; i++) { scaled[i] = (double)sat_checkpoint_counts[i]; if (scaled[i] > ymax) ymax = scaled[i]; }
+        fprintf(f, "<h2>Library complexity (saturation curve)</h2>\n<div class=\"card\">\n");
+        svg_line_chart(f, scaled, SAT_CHECKPOINTS, 0, ymax * 1.15, "#d68a4f");
+        fprintf(f, "</div>\n<p class=\"note\">X axis: subsample depth, 10%% to 100%% of all mapped "
+                   "%s. Y axis: distinct (chromosome, position, strand) combinations found at that "
+                   "depth -- i.e. how many unique molecules this many reads would have captured, "
+                   "computed on a fixed random shuffle of the real mapped reads (not simulated). "
+                   "Still rising steeply at 100%% means deeper sequencing would likely find "
+                   "substantial new material; a flattening curve means this library is close to "
+                   "saturated at the depth sequenced here. Analogous to Preseq's c_curve, though "
+                   "this describes the observed depth's shape rather than Preseq's own statistical "
+                   "extrapolation beyond it.</p>\n", paired_mode ? "fragments" : "reads");
+    }
+
+    /* --- Duplication vs. expression (dupRadar-equivalent) -------------- */
+    {
+        DupradarGene *rows = xmalloc(sizeof(DupradarGene) * (size_t)(n_genes > 0 ? n_genes : 1));
+        double pearson_r;
+        int n = compute_dupradar_genes(rows, &pearson_r);
+        if (n >= 3) {
+            int w = SVG_W, h = SVG_H;
+            int ml = 55, mr = 20, mt = 16, mb = 40;
+            int pw = w - ml - mr, ph = h - mt - mb;
+            double xmin = rows[0].log2_rpk, xmax = rows[n-1].log2_rpk;
+            if (xmax <= xmin) { xmin -= 1; xmax += 1; }
+            fprintf(f, "<h2>Duplication vs. expression (dupRadar-equivalent)</h2>\n<div class=\"card\">\n");
+            fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", w, h);
+            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#ccc\"/>\n", ml, mt + ph, ml + pw, mt + ph);
+            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#ccc\"/>\n", ml, mt, ml, mt + ph);
+            fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#555\" text-anchor=\"middle\">expression (log2 RPK)</text>\n", ml + pw / 2, h - 8);
+            fprintf(f, "<text x=\"14\" y=\"%d\" font-size=\"12\" fill=\"#555\" transform=\"rotate(-90 14 %d)\">dup rate</text>\n", mt + ph / 2, mt + ph / 2);
+            for (int i = 0; i < n; i++) {
+                int cx = ml + (int)(pw * (rows[i].log2_rpk - xmin) / (xmax - xmin));
+                int cy = mt + ph - (int)(ph * rows[i].dup_rate);
+                fprintf(f, "<circle cx=\"%d\" cy=\"%d\" r=\"2\" fill=\"#c8622d\" fill-opacity=\"0.45\"/>\n", cx, cy);
+            }
+            char r_str[16];
+            if (isnan(pearson_r)) snprintf(r_str, sizeof(r_str), "n/a");
+            else snprintf(r_str, sizeof(r_str), "%.3f", pearson_r);
+            fprintf(f, "</svg>\n</div>\n<p class=\"note\">Each point is one gene (&ge;%d uniquely-assigned %s, "
+                       "position-based duplicates: identical chrom+position+strand, Picard-style -- computed "
+                       "independently of --umi-len). Pearson r = %s. A rising trend (duplication increasing with "
+                       "expression) is the expected pattern for ordinary PCR-driven duplication; genes far above "
+                       "the trend for their expression level are candidates for a library-prep artifact rather "
+                       "than real signal. Analogous to dupRadar's duplication-rate-vs-expression plot%s. Full "
+                       "per-gene values: dupradar.tsv.</p>\n",
+                       MIN_UNITS_FOR_DUPRADAR, paired_mode ? "fragments" : "reads", r_str,
+                       global_umi_len_used > 0 ? " (computed on the post-UMI-dedup residual here)" : "");
+        }
+        free(rows);
+    }
+
+    /* --- Junction annotation (RSeQC-equivalent) ------------------------ */
+    {
+        long total_events = junc_events[0] + junc_events[1] + junc_events[2];
+        if (g_n_known_junctions > 0 && total_events > 0) {
+            int w = SVG_W, h = 170;
+            int ml = 140, mr = 60, mt = 16, bar_h = 28, gap = 14;
+            int pw = w - ml - mr;
+            const char *labels[3] = {"Known", "Partial novel", "Complete novel"};
+            const char *colors[3] = {"#2e8b57", "#c8962d", "#c0392b"};
+            fprintf(f, "<h2>Junction annotation (RSeQC-equivalent)</h2>\n<div class=\"card\">\n");
+            fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", w, h);
+            for (int c = 0; c < 3; c++) {
+                int y = mt + c * (bar_h + gap);
+                double frac = (double)junc_events[c] / (double)total_events;
+                int bw = (int)(pw * frac);
+                fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"13\" fill=\"#333\" text-anchor=\"end\">%s</text>\n",
+                        ml - 10, y + bar_h / 2 + 4, labels[c]);
+                fprintf(f, "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"%s\"/>\n", ml, y, bw > 2 ? bw : 2, bar_h, colors[c]);
+                fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#333\">%ld (%.1f%%)</text>\n",
+                        ml + bw + 6, y + bar_h / 2 + 4, junc_events[c], 100.0 * frac);
+            }
+            fprintf(f, "</svg>\n</div>\n<p class=\"note\">%ld splicing event(s) (one per spliced alignment) classified "
+                       "against %ld splice junction(s) annotated in the GTF's exon rows -- known: both splice sites "
+                       "match an annotated junction as a pair; partial novel: one site is annotated but paired with "
+                       "an unannotated site; complete novel: neither site is annotated. Same three-way classification "
+                       "RSeQC's junction_annotation.py reports. Full per-junction list (chrom, intron start/end, "
+                       "category, supporting-read count): junctions.tsv.</p>\n",
+                       total_events, g_n_known_junctions);
+        }
+    }
+
     /* --- Fragment size distribution (paired-end only) ----------------- */
     if (paired_mode) {
         #define FRAG_NBINS 15
@@ -2099,6 +4672,118 @@ static void write_html_report(const char *outdir, const char *reads_desc) {
     fclose(f);
 }
 
+/* ---------------------------------------------------------------------- */
+/* Contaminant genome screening (optional, --contaminant-ref path[:Label])*/
+/* ---------------------------------------------------------------------- */
+
+/* BBSplit's actual job (this is the mechanism, not a specific bundled
+ * database -- BBSplit itself doesn't ship reference genomes either; the
+ * person running it supplies which genomes to screen against, same as
+ * here): for reads that didn't map to the primary genome, check whether
+ * they map cleanly to a *different* genome the person is worried about
+ * contaminating their sample -- common cases are PhiX (a universal
+ * Illumina sequencing control spiked into most runs at low concentration),
+ * a suspected cross-species contaminant, or a common lab organism like
+ * E. coli or mycoplasma. This reuses the exact same k-mer-seeded aligner
+ * as primary alignment; it isn't a separate, lesser check.
+ *
+ * MUST run after every primary-genome-dependent output (SAM, BAM, bigWig,
+ * gene_counts, QC report, HTML report) is already written -- see
+ * free_reference_index()'s comment for why. This function destroys the
+ * primary genome's index and chromosome data as it goes (one reference at
+ * a time, screening only reads still unmapped after each prior screen, the
+ * same sequential-priority approach BBSplit uses) and does not restore it;
+ * nothing may read primary-genome state after this call. Screened reads'
+ * `aln` fields end up reflecting the *last contaminant reference checked*,
+ * not the primary genome -- that's fine only because this genuinely is the
+ * last thing the program does with read alignment state. */
+static void try_contaminant_screen(char paths[][1024], char labels[][64], int n_refs, const char *outdir) {
+    if (n_refs == 0) return;
+
+    int step = paired_mode ? 2 : 1;
+    int n_units = n_reads / step;
+    int *unmapped = xmalloc(sizeof(int) * (size_t)n_units);
+    int n_unmapped = 0;
+    for (int u = 0; u < n_units; u++) {
+        Read *r = paired_mode ? &reads[2*u] : &reads[u];
+        if (!r->aln.mapped) unmapped[n_unmapped++] = u;
+    }
+    long primary_unmapped_total = n_unmapped;
+
+    printf("\n[Contaminant screening] %ld %s unmapped against the primary genome; screening against %d reference(s)\n",
+           primary_unmapped_total, paired_mode ? "fragment(s)" : "read(s)", n_refs);
+
+    char report_path[1100];
+    snprintf(report_path, sizeof(report_path), "%s/contaminant_screen.txt", outdir);
+    FILE *rf = fopen(report_path, "w");
+    if (rf) {
+        fprintf(rf, "Contaminant screening (BBSplit-equivalent mechanism)\n");
+        fprintf(rf, "======================================================\n\n");
+        fprintf(rf, "%ld %s unmapped against the primary genome, screened sequentially\n",
+                primary_unmapped_total, paired_mode ? "fragment(s)" : "read(s)");
+        fprintf(rf, "against %d additional reference(s) (each screen only checks what's still\n", n_refs);
+        fprintf(rf, "unmapped after the previous one -- BBSplit's sequential-priority approach):\n\n");
+    }
+
+    int *remaining = unmapped;
+    int n_remaining = n_unmapped;
+
+    for (int ri = 0; ri < n_refs; ri++) {
+        printf("  [%d/%d] %s (%s): screening %d remaining unmapped %s...\n",
+               ri + 1, n_refs, labels[ri], paths[ri], n_remaining, paired_mode ? "fragment(s)" : "read(s)");
+
+        free_reference_index();
+        load_reference(paths[ri]);
+        build_kmer_index();
+
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int k = 0; k < n_remaining; k++) {
+            int u = remaining[k];
+            Read *r1 = paired_mode ? &reads[2*u] : &reads[u];
+            free(r1->aln.hits); memset(&r1->aln, 0, sizeof(r1->aln));
+            align_read(r1);
+            if (paired_mode) {
+                Read *r2 = &reads[2*u + 1];
+                free(r2->aln.hits); memset(&r2->aln, 0, sizeof(r2->aln));
+                align_read(r2);
+            }
+        }
+
+        int *next_remaining = xmalloc(sizeof(int) * (size_t)(n_remaining > 0 ? n_remaining : 1));
+        int n_next = 0;
+        long matched = 0;
+        for (int k = 0; k < n_remaining; k++) {
+            int u = remaining[k];
+            Read *r1 = paired_mode ? &reads[2*u] : &reads[u];
+            int hit = r1->aln.mapped;
+            if (paired_mode) hit = hit || reads[2*u + 1].aln.mapped;
+            if (hit) matched++; else next_remaining[n_next++] = u;
+        }
+
+        double pct = n_remaining ? 100.0 * (double)matched / (double)n_remaining : 0.0;
+        printf("        -> %ld matched (%.2f%% of screened)\n", matched, pct);
+        if (rf) fprintf(rf, "%-24s : %8ld matched (%.2f%% of %d screened this round)\n",
+                        labels[ri], matched, pct, n_remaining);
+
+        if (remaining != unmapped) free(remaining);
+        remaining = next_remaining;
+        n_remaining = n_next;
+    }
+
+    if (rf) {
+        double pct_unexplained = primary_unmapped_total ? 100.0 * (double)n_remaining / (double)primary_unmapped_total : 0.0;
+        fprintf(rf, "\n%d %s remain unmapped after all contaminant screens (%.2f%% of the original\n",
+                n_remaining, paired_mode ? "fragment(s)" : "read(s)", pct_unexplained);
+        fprintf(rf, "primary-unmapped set) -- not explained by any reference screened here; could\n");
+        fprintf(rf, "be low-quality reads, adapter dimers, an unscreened contaminant, or sequence\n");
+        fprintf(rf, "genuinely absent from every reference given.\n");
+        fclose(rf);
+        printf("  -> wrote %s\n", report_path);
+    }
+    if (remaining != unmapped) free(remaining);
+    free(unmapped);
+}
+
 
 static void write_summary(const char *outdir, const char *ref_path, const char *gtf_path,
                            const char *reads_desc) {
@@ -2140,6 +4825,218 @@ static void write_summary(const char *outdir, const char *ref_path, const char *
     if (paired_mode)
         fprintf(f, "  Proper pairs (FR, same chrom): %ld (%.1f%% of pairs)\n", n_proper_pairs, n_units ? 100.0 * n_proper_pairs / n_units : 0.0);
     fprintf(f, "\n");
+
+    {
+        char msg[160];
+        const char *verdict = classify_strandedness(last_strand_concordant, last_strand_discordant, msg, sizeof(msg));
+        fprintf(f, "Strandedness\n");
+        fprintf(f, "  Inferred protocol : %s\n", verdict);
+        fprintf(f, "  Basis             : %s\n", msg);
+        fprintf(f, "  (%ld concordant, %ld discordant, of %ld uniquely-assigned %s used for this check)\n",
+                last_strand_concordant, last_strand_discordant, last_strand_concordant + last_strand_discordant,
+                paired_mode ? "fragments" : "reads");
+        if (last_strand_resolved_units > 0) {
+            fprintf(f, "  Used to disambiguate %ld multi-gene assignment(s): where a fragment\n", last_strand_resolved_units);
+            fprintf(f, "  overlapped >1 gene by position alone, candidates inconsistent with the\n");
+            fprintf(f, "  inferred strand were dropped when doing so left >=1 candidate (never\n");
+            fprintf(f, "  used to force an assignment to zero candidates -- see README.md's\n");
+            fprintf(f, "  \"On strandedness and gene assignment\" section).\n\n");
+        } else {
+            fprintf(f, "  (Library not confidently one-directional enough to use for\n");
+            fprintf(f, "  multi-gene disambiguation, or no ambiguous units needed it.)\n\n");
+        }
+    }
+
+    if (n_duplicate_units > 0 || global_umi_len_used > 0) {
+        fprintf(f, "UMI-aware deduplication (--umi-len %d, directional-adjacency method)\n", global_umi_len_used);
+        fprintf(f, "  %s marked duplicate    : %ld (excluded from gene counts; still in\n",
+                paired_mode ? "Fragments" : "Reads", n_duplicate_units);
+        fprintf(f, "                              alignments.sam/.bam with SAM flag 0x400 set)\n");
+        fprintf(f, "    of which, via exact chrom+pos+strand+UMI match : %ld\n", n_duplicate_units - n_duplicate_units_via_clustering);
+        fprintf(f, "    of which, via directional UMI clustering only  : %ld (edit-distance-1\n", n_duplicate_units_via_clustering);
+        fprintf(f, "                              UMI relatives merged by count-directional\n");
+        fprintf(f, "                              adjacency -- these are duplicates exact-match\n");
+        fprintf(f, "                              alone would have missed)\n\n");
+    }
+
+    {
+        BiotypeBreakdown b = compute_biotype_breakdown();
+        fprintf(f, "RNA biotype content (rRNA-screening-equivalent QC, from GTF gene_biotype)\n");
+        if (b.total <= 0 || (b.rrna == 0 && b.trna == 0 && b.protein_coding == 0 && b.other == 0)) {
+            fprintf(f, "  GTF has no gene_biotype attribute (or biotype-tagged genes got zero reads) --\n");
+            fprintf(f, "  skipping. Re-generate your GTF with convert_gff3_to_gtf.py (or add\n");
+            fprintf(f, "  gene_biotype \"...\"; yourself) to get this breakdown.\n\n");
+        } else {
+            fprintf(f, "  rRNA             : %10.1f effective reads (%.2f%% of assigned)\n", b.rrna, 100.0 * b.rrna / b.total);
+            fprintf(f, "  tRNA             : %10.1f effective reads (%.2f%% of assigned)\n", b.trna, 100.0 * b.trna / b.total);
+            fprintf(f, "  protein_coding   : %10.1f effective reads (%.2f%% of assigned)\n", b.protein_coding, 100.0 * b.protein_coding / b.total);
+            fprintf(f, "  other biotypes   : %10.1f effective reads (%.2f%% of assigned)\n", b.other, 100.0 * b.other / b.total);
+            if (b.unknown > 0) fprintf(f, "  unknown biotype  : %10.1f effective reads (%.2f%% of assigned)\n", b.unknown, 100.0 * b.unknown / b.total);
+            if (b.total > 0 && 100.0 * b.rrna / b.total > 20.0)
+                fprintf(f, "  NOTE: >20%% rRNA is high for a typical polyA-selected or rRNA-depleted\n"
+                            "        library and may indicate incomplete rRNA depletion during prep.\n");
+            fprintf(f, "\n");
+        }
+    }
+
+    {
+        double curve[GENEBODY_BINS];
+        int n_qual = aggregate_genebody_coverage(curve);
+        fprintf(f, "Gene-body coverage (RSeQC geneBody_coverage.py-equivalent QC)\n");
+        if (n_qual == 0) {
+            fprintf(f, "  No genes had >=%d uniquely-assigned reads and >=200bp length --\n", MIN_READS_FOR_GENEBODY);
+            fprintf(f, "  skipping (too little data for a meaningful curve on this run).\n\n");
+        } else {
+            /* condense 100 bins down to 10 for a compact text table; the
+             * HTML report has the full-resolution curve as an SVG plot */
+            double decile[10] = {0};
+            for (int b = 0; b < GENEBODY_BINS; b++) decile[b / 10] += curve[b] / 10.0;
+            fprintf(f, "  Averaged over %d qualifying genes (>=%d unique reads, >=200bp each),\n", n_qual, MIN_READS_FOR_GENEBODY);
+            fprintf(f, "  each gene's own coverage curve normalized to sum to 1 before averaging\n");
+            fprintf(f, "  (so highly-expressed genes don't dominate the shape):\n");
+            fprintf(f, "  5' end   ");
+            for (int d = 0; d < 10; d++) fprintf(f, "%5.1f%%", 100.0 * decile[d]);
+            fprintf(f, "   3' end\n");
+            double first10 = 0, last10 = 0;
+            for (int b = 0; b < 10; b++) first10 += curve[b];
+            for (int b = 90; b < 100; b++) last10 += curve[b];
+            double bias = first10 > 1e-12 ? last10 / first10 : 0.0;
+            fprintf(f, "  3'/5' bias ratio (last 10%% / first 10%%): %.2f", bias);
+            if (bias > 1.5) fprintf(f, "  -- 3'-biased (common with degraded RNA or polyA-selected prep)\n");
+            else if (bias < 0.67) fprintf(f, "  -- 5'-biased (less common; check library prep)\n");
+            else fprintf(f, "  -- roughly uniform\n");
+            fprintf(f, "\n");
+        }
+    }
+
+    {
+        fprintf(f, "Library complexity / saturation curve (Preseq-equivalent QC)\n");
+        if (!sat_computed || sat_total_mapped == 0) {
+            fprintf(f, "  No mapped fragments to analyze -- skipping.\n\n");
+        } else {
+            fprintf(f, "  %ld mapped %s total, %ld at distinct (chrom, position, strand)\n",
+                    sat_total_mapped, paired_mode ? "fragments" : "reads", sat_total_distinct);
+            fprintf(f, "  combinations (%.1f%% of mapped %s are the first occurrence of their\n",
+                    100.0 * sat_total_distinct / sat_total_mapped, paired_mode ? "fragments" : "reads");
+            fprintf(f, "  position -- NOT the same as UMI-deduplicated count above, since this\n");
+            fprintf(f, "  intentionally runs on raw mapped positions before any dedup, matching\n");
+            fprintf(f, "  Preseq's own convention for characterizing library complexity):\n");
+            fprintf(f, "  subsample:  ");
+            for (int i = 0; i < SAT_CHECKPOINTS; i++) fprintf(f, "%7d%%", 10 * (i + 1));
+            fprintf(f, "\n");
+            fprintf(f, "  distinct:   ");
+            for (int i = 0; i < SAT_CHECKPOINTS; i++) fprintf(f, "%8ld", sat_checkpoint_counts[i]);
+            fprintf(f, "\n");
+            /* Slope of the curve over its last 20% -- a simple, honest proxy for
+             * "still finding new material" vs. "plateaued", without pretending
+             * to be Preseq's actual statistical extrapolation model (Preseq
+             * fits a rational-function/Good-Toulmin estimator to project yield
+             * at UNSEQUENCED depths; this only describes the curve's shape over
+             * the depth actually observed in this run, and says so). */
+            double last_slope = (sat_checkpoint_counts[SAT_CHECKPOINTS-1] - sat_checkpoint_counts[SAT_CHECKPOINTS-3])
+                                 / (double)(sat_checkpoint_counts[SAT_CHECKPOINTS-1] > 0 ? sat_checkpoint_counts[SAT_CHECKPOINTS-1] : 1);
+            if (last_slope > 0.15) {
+                fprintf(f, "  Still rising steeply near full depth (last 20%% of the subsample added\n");
+                fprintf(f, "  %.0f%% more distinct positions) -- this library is likely far from\n", 100.0*last_slope);
+                fprintf(f, "  saturated; sequencing deeper would probably find substantial new\n");
+                fprintf(f, "  material.\n");
+            } else if (last_slope > 0.05) {
+                fprintf(f, "  Still rising moderately near full depth (+%.0f%% in the last 20%% of the\n", 100.0*last_slope);
+                fprintf(f, "  subsample) -- some further sequencing would likely still find new\n");
+                fprintf(f, "  material, with diminishing returns.\n");
+            } else {
+                fprintf(f, "  Flattening out near full depth (+%.0f%% in the last 20%% of the\n", 100.0*last_slope);
+                fprintf(f, "  subsample) -- this library looks close to saturated at the depth\n");
+                fprintf(f, "  sequenced here; deeper sequencing would mostly re-read existing\n");
+                fprintf(f, "  material rather than find much new.\n");
+            }
+            fprintf(f, "  NOTE: this describes the curve's shape over the depth actually observed\n");
+            fprintf(f, "  in this run -- it is not Preseq's statistical extrapolation to predict\n");
+            fprintf(f, "  yield at sequencing depths beyond what was actually run.\n\n");
+        }
+    }
+
+    {
+        DupradarGene *rows = xmalloc(sizeof(DupradarGene) * (size_t)(n_genes > 0 ? n_genes : 1));
+        double pearson_r;
+        int n = compute_dupradar_genes(rows, &pearson_r);
+        fprintf(f, "Duplication vs. expression (dupRadar-equivalent QC%s)\n",
+                global_umi_len_used > 0 ? ", post-UMI-dedup residual" : "");
+        if (n < 3) {
+            fprintf(f, "  Fewer than 3 genes had >=%d uniquely-assigned reads -- skipping (too\n", MIN_UNITS_FOR_DUPRADAR);
+            fprintf(f, "  little data for a meaningful duplication-vs-expression relationship).\n\n");
+        } else {
+            long total_units = 0, total_dup = 0;
+            for (int i = 0; i < n; i++) { total_units += dupr_gene_total[rows[i].gene_idx]; total_dup += dupr_gene_dup[rows[i].gene_idx]; }
+            fprintf(f, "  Position-based duplicates (chrom+pos+strand, Picard-style; independent\n");
+            fprintf(f, "  of --umi-len), among %d genes with >=%d uniquely-assigned %s each:\n",
+                    n, MIN_UNITS_FOR_DUPRADAR, paired_mode ? "fragments" : "reads");
+            fprintf(f, "    overall duplication rate across these genes : %.1f%% (%ld/%ld)\n",
+                    100.0 * total_dup / (total_units > 0 ? total_units : 1), total_dup, total_units);
+            if (isnan(pearson_r)) fprintf(f, "    Pearson r(log2 RPK, duplication rate)       : n/a\n");
+            else fprintf(f, "    Pearson r(log2 RPK, duplication rate)       : %.3f\n", pearson_r);
+            fprintf(f, "  10 expression-ordered bins (lowest RPK first), mean duplication rate:\n");
+            fprintf(f, "    bin:     ");
+            for (int b = 0; b < 10; b++) fprintf(f, "%6d", b + 1);
+            fprintf(f, "\n    dup rate:");
+            for (int b = 0; b < 10; b++) {
+                int lo = (b * n) / 10, hi = ((b + 1) * n) / 10;
+                if (hi <= lo) { fprintf(f, "     -%%"); continue; }
+                double sum = 0; for (int i = lo; i < hi; i++) sum += rows[i].dup_rate;
+                fprintf(f, " %4.0f%%", 100.0 * sum / (hi - lo));
+            }
+            fprintf(f, "\n");
+            if (!isnan(pearson_r) && pearson_r > 0.3) {
+                fprintf(f, "  Duplication rate rises with expression (r=%.2f) -- the expected pattern\n", pearson_r);
+                fprintf(f, "  for ordinary PCR-driven duplication of highly-expressed genes, not\n");
+                fprintf(f, "  evidence of a library-prep artifact.\n\n");
+            } else if (!isnan(pearson_r) && pearson_r < -0.1) {
+                fprintf(f, "  Duplication rate does NOT rise with expression (r=%.2f) -- unusual;\n", pearson_r);
+                fprintf(f, "  worth checking individual high-duplication/low-expression genes in\n");
+                fprintf(f, "  dupradar.tsv for a possible amplification or input-material artifact.\n\n");
+            } else {
+                if (isnan(pearson_r)) fprintf(f, "  Weak/undefined relationship between duplication and expression -- within\n");
+                else fprintf(f, "  Weak relationship between duplication and expression (r=%.2f) -- within\n", pearson_r);
+                fprintf(f, "  the range this dataset's depth/complexity could plausibly produce either\n");
+                fprintf(f, "  way; see dupradar.tsv for the full per-gene picture.\n\n");
+            }
+            fprintf(f, "  Full per-gene table: dupradar.tsv (gene_id, total_count, dup_count,\n");
+            fprintf(f, "  dup_rate, rpk, log2_rpk). See Junction annotation below for the\n");
+            fprintf(f, "  RSeQC-equivalent known-vs-novel splice site breakdown.\n\n");
+        }
+        free(rows);
+    }
+
+    {
+        long total_events = junc_events[0] + junc_events[1] + junc_events[2];
+        long total_unique = junc_unique[0] + junc_unique[1] + junc_unique[2];
+        fprintf(f, "Junction annotation (RSeQC-equivalent: known vs. novel splice sites)\n");
+        if (g_n_known_junctions == 0) {
+            fprintf(f, "  No annotated exon-exon junctions found in the GTF (single-exon-only\n");
+            fprintf(f, "  annotation, or no \"exon\" feature rows) -- every observed splice, if any,\n");
+            fprintf(f, "  would trivially classify as novel, so this section is skipped rather than\n");
+            fprintf(f, "  reported as a meaningless 0%%-known result.\n\n");
+        } else if (total_events == 0) {
+            fprintf(f, "  %ld known splice junction(s) indexed from the GTF; no spliced alignments\n", g_n_known_junctions);
+            fprintf(f, "  observed in this run (expected for organisms/libraries with few or no\n");
+            fprintf(f, "  introns, or reads too short to span one).\n\n");
+        } else {
+            fprintf(f, "  %ld known splice junction(s) indexed from the GTF's exon rows.\n", g_n_known_junctions);
+            fprintf(f, "  By splicing event (%ld spliced alignment(s) total):\n", total_events);
+            fprintf(f, "    known            : %6ld (%.1f%%)\n", junc_events[JUNC_KNOWN], 100.0 * junc_events[JUNC_KNOWN] / total_events);
+            fprintf(f, "    partial novel    : %6ld (%.1f%%)\n", junc_events[JUNC_PARTIAL_NOVEL], 100.0 * junc_events[JUNC_PARTIAL_NOVEL] / total_events);
+            fprintf(f, "    complete novel   : %6ld (%.1f%%)\n", junc_events[JUNC_COMPLETE_NOVEL], 100.0 * junc_events[JUNC_COMPLETE_NOVEL] / total_events);
+            fprintf(f, "  By distinct junction (%ld unique chrom+donor+acceptor combination(s)):\n", total_unique);
+            fprintf(f, "    known            : %6ld (%.1f%%)\n", junc_unique[JUNC_KNOWN], 100.0 * junc_unique[JUNC_KNOWN] / total_unique);
+            fprintf(f, "    partial novel    : %6ld (%.1f%%)\n", junc_unique[JUNC_PARTIAL_NOVEL], 100.0 * junc_unique[JUNC_PARTIAL_NOVEL] / total_unique);
+            fprintf(f, "    complete novel   : %6ld (%.1f%%)\n", junc_unique[JUNC_COMPLETE_NOVEL], 100.0 * junc_unique[JUNC_COMPLETE_NOVEL] / total_unique);
+            fprintf(f, "  A high known fraction confirms both the annotation and the spliced-\n");
+            fprintf(f, "  alignment path agree with each other; complete-novel junctions are\n");
+            fprintf(f, "  candidates for unannotated real splicing OR alignment artifacts (rare\n");
+            fprintf(f, "  with short introns/simple genomes, worth scrutinizing more on complex\n");
+            fprintf(f, "  ones) -- see junctions.tsv for the full per-junction list.\n\n");
+        }
+    }
 
     fprintf(f, "Gene-level quantification (EM, RSEM/Salmon-style)\n");
     fprintf(f, "  %s uniquely assigned  : %ld\n", paired_mode ? "Fragments" : "Reads", n_unique_units);
@@ -3489,11 +6386,104 @@ static void usage(const char *prog) {
         "Usage:\n"
         "  %s <reference.fasta> <annotation.gtf> se <reads.fastq> <outdir>\n"
         "  %s <reference.fasta> <annotation.gtf> pe <r1.fastq> <r2.fastq> <outdir>\n"
+        "\n"
+        "  Multi-lane samples: comma-separate lane paths in place of a single FASTQ,\n"
+        "  e.g. pe L001_R1.fq.gz,L002_R1.fq.gz L001_R2.fq.gz,L002_R2.fq.gz  (R1/R2 lane\n"
+        "  counts must match, in order). Lanes are concatenated before trimming/alignment.\n"
+        "\n"
+        "  --max-intron N   Widest intron (bp) the spliced-alignment search will consider.\n"
+        "                   Default 15000, validated against real yeast introns (max ~766bp).\n"
+        "                   Raise for organisms with longer introns -- human introns commonly\n"
+        "                   exceed 15000bp and some exceed 1000000bp. Beyond a 20000bp safe\n"
+        "                   range, a canonical GT-AG splice site is REQUIRED (not just\n"
+        "                   preferred) to guard against distant coincidental matches -- see\n"
+        "                   README.md's Junction annotation section for the measured before/\n"
+        "                   after and a synthetic large-intron positive control.\n"
         "  %s compare <sample1_outdir> <sample2_outdir> [more...] <combined_outdir>\n",
         prog, prog, prog);
 }
 
+/* Scans argv for an optional "--umi-len N" pair anywhere among the
+ * arguments, removes it (shifting everything after it left by two slots)
+ * so the rest of main()'s positional parsing is unaffected by where the
+ * flag was placed, and returns N (0 if the flag wasn't present, meaning
+ * UMI handling is off -- the default, fully backward-compatible). */
+static int extract_umi_len_flag(int *argc_ptr, char **argv) {
+    int argc = *argc_ptr;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--umi-len") == 0) {
+            int umi_len = atoi(argv[i + 1]);
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            *argc_ptr = argc - 2;
+            return umi_len;
+        }
+    }
+    return 0;
+}
+
+#define MAX_CONTAMINANT_REFS 8
+static char contaminant_ref_paths[MAX_CONTAMINANT_REFS][1024];
+static char contaminant_ref_labels[MAX_CONTAMINANT_REFS][64];
+static int n_contaminant_refs = 0;
+
+/* Scans argv for "--contaminant-ref path[:Label]" (repeatable, up to
+ * MAX_CONTAMINANT_REFS times), removing each match so the rest of
+ * main()'s positional parsing is unaffected. path can itself be
+ * gzipped/plain, anything open_maybe_gz() accepts. Label is optional and
+ * defaults to "ref1", "ref2", ... if omitted -- e.g.
+ * "--contaminant-ref phix.fa.gz:PhiX --contaminant-ref ecoli.fa:E.coli". */
+static void extract_contaminant_ref_flags(int *argc_ptr, char **argv) {
+    int argc = *argc_ptr;
+    int out = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--contaminant-ref") == 0 && i + 1 < argc) {
+            if (n_contaminant_refs < MAX_CONTAMINANT_REFS) {
+                char *val = argv[i + 1];
+                char *colon = strrchr(val, ':');
+                if (colon && colon != val) {
+                    size_t pathlen = (size_t)(colon - val);
+                    if (pathlen > 1023) pathlen = 1023;
+                    memcpy(contaminant_ref_paths[n_contaminant_refs], val, pathlen);
+                    contaminant_ref_paths[n_contaminant_refs][pathlen] = '\0';
+                    strncpy(contaminant_ref_labels[n_contaminant_refs], colon + 1, 63);
+                    contaminant_ref_labels[n_contaminant_refs][63] = '\0';
+                } else {
+                    strncpy(contaminant_ref_paths[n_contaminant_refs], val, 1023);
+                    contaminant_ref_paths[n_contaminant_refs][1023] = '\0';
+                    snprintf(contaminant_ref_labels[n_contaminant_refs], 64, "ref%d", n_contaminant_refs + 1);
+                }
+                n_contaminant_refs++;
+            }
+            i++; /* consumed the value too */
+            continue;
+        }
+        argv[out++] = argv[i];
+    }
+    *argc_ptr = out;
+}
+
 int main(int argc, char **argv) {
+    int umi_len = extract_umi_len_flag(&argc, argv);
+    global_umi_len_used = umi_len;
+    extract_contaminant_ref_flags(&argc, argv);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--fm-index") == 0) {
+            g_use_fm_index = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            break;
+        }
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--max-intron") == 0) {
+            long v = atol(argv[i + 1]);
+            if (v < MIN_INTRON) die("--max-intron must be >= MIN_INTRON (20)");
+            g_max_intron = v;
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            break;
+        }
+    }
     if (argc >= 2 && strcmp(argv[1], "compare") == 0) return run_compare_mode(argc, argv);
     if (argc < 6) { usage(argv[0]); return 1; }
 
@@ -3514,25 +6504,69 @@ int main(int argc, char **argv) {
     } else { usage(argv[0]); return 1; }
 
     printf("[1/7] Loading reference + k-mer index (k=%d): %s\n", KMER_LEN, ref_path);
+    if (g_max_intron != MAX_INTRON_DEFAULT)
+        printf("      --max-intron %ld (default %d) -- beyond %d bp, a canonical GT-AG "
+               "splice site is required (not just preferred); see README.md's Junction "
+               "annotation section for the measured before/after\n",
+               g_max_intron, MAX_INTRON_DEFAULT, SPLICE_SAFE_INTRON_RANGE);
     if (try_load_index_cache(ref_path)) {
         printf("      -> loaded from cache (%s.kidx): %d sequence(s), skipped FASTA parse + index build\n", ref_path, n_chroms);
         printf("[2/7] (skipped -- index came from cache)\n");
+        if (g_use_fm_index) {
+            /* The .kidx cache only ever covers the k-mer/minimizer index
+             * (see try_load_index_cache/save_index_cache) -- it has no
+             * knowledge of the FM-index at all, so a cache hit here would
+             * otherwise silently skip fm_build() entirely, leaving
+             * g_fm_built at 0 and --fm-index quietly ignored in favor of
+             * the k-mer path with no warning. Build it explicitly. */
+            printf("      building FM-index (not covered by the .kidx cache)...\n");
+            fm_build();
+        }
     } else {
         load_reference(ref_path);
         printf("      -> %d sequence(s) loaded from FASTA\n", n_chroms);
         printf("[2/7] Building k-mer index (k=%d)\n", KMER_LEN);
-        build_kmer_index();
-        save_index_cache(ref_path);
-        printf("      -> index cached for future runs: %s.kidx\n", ref_path);
+        build_kmer_index(); /* builds the FM-index too, when g_use_fm_index is set --
+                                see build_kmer_index()'s own body */
+        if (!g_use_fm_index) {
+            /* Only cache when the minimizer k-mer table was actually built.
+             * Round 5 found this the hard way: build_kmer_index() skips
+             * build_kmer_index_minimizer() entirely when --fm-index is set
+             * (see its own body) -- kmer_table is left empty -- but this
+             * call used to run unconditionally regardless, silently
+             * writing that EMPTY table to the shared .kidx cache file.
+             * Any later run against the same genome without --fm-index
+             * would then load that cache, believe it was a valid warm hit
+             * ("skipped FASTA parse + index build"), and align against an
+             * empty index -- alignment rate observed dropping from the
+             * correct ~97% to ~12-14% on the real yeast dataset, silently,
+             * with no error. The FM-index path already rebuilds fresh on
+             * every run regardless of cache state (see the cache-HIT
+             * branch just above, which calls fm_build() explicitly for
+             * exactly this reason) -- so an FM-index run never needed to
+             * write this cache at all; it just wasn't guarded from doing
+             * so accidentally. */
+            save_index_cache(ref_path);
+            printf("      -> index cached for future runs: %s.kidx\n", ref_path);
+        }
     }
 
     printf("[3/7] Loading GTF annotation: %s\n", gtf_path);
     load_gtf(gtf_path);
     printf("      -> %d gene(s) loaded\n", n_genes);
+    genebody_hist_alloc();
+    load_known_junctions(gtf_path);
+    if (g_n_known_junctions > 0)
+        printf("      -> %ld known splice junction(s) indexed (from GTF exon rows, for junction annotation QC)\n",
+               g_n_known_junctions);
 
     printf("[4/7] Loading reads (%s mode): %s\n", paired_mode ? "paired-end" : "single-end", reads_desc);
     if (paired_mode) load_fastq_pe(argv[4], argv[5]); else load_fastq_se(argv[4]);
     printf("      -> %d read(s) loaded\n", n_reads);
+    if (umi_len > 0) {
+        printf("      extracting %d bp UMI from read1 5' end (--umi-len %d)\n", umi_len, umi_len);
+        extract_umis(umi_len);
+    }
 
     printf("[5/7] Running QC + adapter/quality trimming\n");
     #pragma omp parallel for schedule(dynamic, 256)
@@ -3541,6 +6575,11 @@ int main(int argc, char **argv) {
     printf("[6/7] Aligning reads (k-mer seed + ungapped/spliced extension, multi-mapping-aware)\n");
     #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < n_reads; i++) align_read(&reads[i]);
+    if (umi_len > 0) {
+        umi_dedup(umi_len);
+        printf("      UMI dedup: %ld duplicate unit(s) marked (directional-adjacency method, %ld via clustering)\n", n_duplicate_units, n_duplicate_units_via_clustering);
+    }
+    compute_saturation_curve();
     if (paired_mode) {
         long proper_local = 0;
         #pragma omp parallel for schedule(dynamic, 256) reduction(+:proper_local)
@@ -3552,11 +6591,22 @@ int main(int argc, char **argv) {
     printf("[7/7] EM quantification + writing output files to: %s\n", outdir);
     quantify_em();
     write_sam(outdir);
+    try_write_sorted_bam(outdir);
+    try_write_bigwig(outdir);
     write_gene_counts(outdir);
+    write_dupradar_tsv(outdir);
+    write_junctions_tsv(outdir);
     write_qc_report(outdir);
     write_summary(outdir, ref_path, gtf_path, reads_desc);
     write_html_report(outdir, reads_desc);
 
+    if (n_contaminant_refs > 0) try_contaminant_screen(contaminant_ref_paths, contaminant_ref_labels, n_contaminant_refs, outdir);
+
     printf("Done. (EM converged in %d iterations)\n", em_iterations_run);
+    {
+        char msg[160];
+        const char *verdict = classify_strandedness(last_strand_concordant, last_strand_discordant, msg, sizeof(msg));
+        printf("Inferred library strandedness: %s (%s)\n", verdict, msg);
+    }
     return 0;
 }

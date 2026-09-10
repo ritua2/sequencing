@@ -40,7 +40,7 @@ python3 ../convert_gff3_to_gtf.py Saccharomyces_cerevisiae.R64-1-1.59.gff3.gz ye
 
 ## 3. Run
 
-Before running the code, ensure that the input files are available.
+Before running the code, ensure that the input files are available. Also ensure that outdir exists (mkdir outdir).
 
 ## SERIAL RUN:
 

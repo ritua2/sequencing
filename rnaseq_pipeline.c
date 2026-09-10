@@ -253,7 +253,6 @@ static long g_max_intron = MAX_INTRON_DEFAULT; /* set via --max-intron, see main
                                             its static-hash-table k-mer index is not evidence of
                                             scaling gracefully to a genome 250x larger). */
 
-
 /* --- EM quantification parameters --- */
 #define MAX_GENES_PER_UNIT          8   /* cap on candidate genes for one read/fragment */
 #define MAX_EM_ITERS               200
@@ -6124,37 +6123,249 @@ static void write_compare_report(CompareSample *samples, int n_samples, int n_ge
                        "see the note above the table for when to trust it.</p>\n");
         }
 
-        /* Volcano plot: log2FoldChange on x, -log10(pvalue) on y */
+        /* Volcano plot: log2FoldChange on x, -log10(q-value/padj) on y --
+         * three significance tiers (not significant / p<=0.05 / q<=0.05),
+         * matching the standard ggplot2-style volcano layout: ~q<0.05 gets
+         * a distinct color from ~p<0.05 specifically because p and padj
+         * answer different questions (uncorrected vs. multiple-testing-
+         * corrected significance) and collapsing them into one threshold
+         * would hide that distinction the two-tier version above didn't
+         * make either -- this replaces that version rather than
+         * duplicating it, since q-value is the more defensible axis for
+         * the primary volcano plot (padj is what "significant" means
+         * everywhere else in this report) and unlabeled p-only tiers
+         * invite exactly the multiple-testing-blind misreading DESeq2's
+         * own documentation warns against. */
         {
-            int w = SVG_W, h = SVG_H + 20;
-            int ml = 55, mr = 20, mt = 16, mb = 40;
+            int w = SVG_W, h = SVG_H + 60;
+            int ml = 55, mr = 55, mt = 40, mb = 70; /* mr wider than the other SVG plots in this
+                report use -- volcano-plot labels routinely sit right at the outer edge (the
+                most significant genes, which is exactly what gets labeled), unlike a
+                scatter/QC plot's more evenly-distributed points, so the standard tighter
+                margin isn't enough here even with the clamped-point label-flip below */
             int pw = w - ml - mr, ph = h - mt - mb;
-            double xmax_abs = 0.1, ymax = 0.1;
+
+            /* Robust axis scaling: a plain max() over ALL genes' unshrunk log2FC gets
+             * wrecked by low-baseMean genes, where a handful of reads in one condition
+             * and none in the other produces a huge but biologically meaningless fold
+             * change (the exact reason DESeq2's own effect-size reporting recommends
+             * LFC shrinkage in the first place) -- one such gene, or even a few thousand
+             * of them in a small/shallow dataset, can dominate the whole plot's x-range
+             * and squash every other point (including the genuinely interesting ones)
+             * into two thin vertical bands at the edges. Bounding the axis by a high
+             * percentile (99th) of |log2FC| among genes with a reasonable baseMean,
+             * rather than the single largest value over every gene regardless of how
+             * little data supports it, keeps the plot readable without silently
+             * dropping any point -- everything is still drawn, just clipped into a
+             * sane range, exactly as this same clamping already did before this
+             * change, only now driven by a value that isn't one outlier away from
+             * ruining the whole plot. */
+            double *lfc_for_scale = xmalloc(sizeof(double) * (size_t)n_de_genes);
+            int n_for_scale = 0;
             for (int g = 0; g < n_de_genes; g++) {
                 if (!de_results[g].pass_filter) continue;
+                if (de_results[g].baseMean < 10) continue; /* same rationale independent
+                    filtering already uses elsewhere in this report: a handful of reads
+                    total isn't enough to trust an effect-size estimate from */
                 double ax = fabs(de_results[g].log2FoldChange);
-                if (ax > xmax_abs && ax < 20) xmax_abs = ax;
-                double neglog = de_results[g].pvalue > 0 ? -log10(de_results[g].pvalue) : 300;
+                if (ax < 20) lfc_for_scale[n_for_scale++] = ax;
+            }
+            double xmax_abs = 0.1;
+            if (n_for_scale > 0) {
+                for (int i = 1; i < n_for_scale; i++) { double key = lfc_for_scale[i]; int j = i-1;
+                    while (j >= 0 && lfc_for_scale[j] > key) { lfc_for_scale[j+1] = lfc_for_scale[j]; j--; } lfc_for_scale[j+1] = key; }
+                int p99_idx = (int)(0.99 * (n_for_scale - 1));
+                xmax_abs = lfc_for_scale[p99_idx];
+                if (xmax_abs < 0.5) xmax_abs = 0.5; /* guard against a near-all-zero-effect
+                    dataset producing an unreadably tight axis */
+            }
+            free(lfc_for_scale);
+
+            double ymax = 0.1;
+            for (int g = 0; g < n_de_genes; g++) {
+                if (!de_results[g].pass_filter) continue;
+                double q = de_results[g].padj;
+                /* q == 0 exactly (a real, common case -- underflow below double precision's
+                 * ~1e-308 floor happens whenever a gene's differential signal is strong and
+                 * clean enough, not a pathological input) is the MOST significant value
+                 * possible, not the least -- treat it as "at or beyond ymax", the top of
+                 * the plot, rather than falling through to 0 (the bottom). Capping at a
+                 * large-but-finite 300 (a q-value of 1e-300 is already far beyond anything
+                 * meaningfully distinguishable on this plot) keeps this path from ever
+                 * feeding an actual infinity into the axis-scale/clamp arithmetic below. */
+                double neglog = isnan(q) ? 0 : (q > 0 ? -log10(q) : 300);
                 if (neglog > ymax && neglog < 50) ymax = neglog;
             }
-            fprintf(f, "<div class=\"card\">\n<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", w, h);
+            xmax_abs *= 1.08; ymax *= 1.08; /* a little headroom so the extreme points and
+                                                their labels aren't flush against the edge */
+
+            fprintf(f, "<div class=\"card\">\n");
+            fprintf(f, "<div style=\"text-align:center;font-size:20px;font-weight:bold;margin-bottom:4px;\">Volcano Plot</div>\n");
+            fprintf(f, "<svg viewBox=\"0 0 %d %d\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"Helvetica,Arial,sans-serif\">\n", w, h);
             int x0 = ml + pw / 2;
-            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#ccc\"/>\n", x0, mt, x0, mt + ph);
-            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#ccc\"/>\n", ml, mt + ph, ml + pw, mt + ph);
-            fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#555\" text-anchor=\"middle\">log2FoldChange</text>\n", ml + pw / 2, h - 8);
+            int y_base = mt + ph; /* y=0 (q=1) sits at the BOTTOM here, unlike the MA plot
+                                      above -- -log10(q) is never negative, so this axis
+                                      isn't mirrored around a center the way log2FC is */
+            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#bbb\" stroke-dasharray=\"5,4\"/>\n", x0, mt, x0, y_base);
+            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#333\" stroke-dasharray=\"1,2\"/>\n", ml, y_base, ml + pw, y_base);
+            fprintf(f, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#333\"/>\n", ml, mt, ml, y_base);
+            for (int yt = 0; yt <= (int)ymax + 1; yt++) {
+                int gy = y_base - (int)(ph * (yt / ymax));
+                if (gy < mt) break;
+                fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"13\" fill=\"#333\" text-anchor=\"end\">%d</text>\n", ml - 8, gy + 4, yt);
+            }
+            char xt_buf[16];
+            for (int xt = -2; xt <= 2; xt++) {
+                if (fabs(xt) > xmax_abs + 0.01 && xt != 0) continue;
+                int gx = x0 + (int)((pw / 2) * (xt / xmax_abs));
+                snprintf(xt_buf, sizeof(xt_buf), "%d", xt);
+                fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"13\" fill=\"#333\" text-anchor=\"middle\">%s</text>\n", gx, y_base + 20, xt_buf);
+            }
+            fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"14\" font-weight=\"bold\" fill=\"#222\" text-anchor=\"middle\">Log2(FC)</text>\n", x0, h - 30);
+            fprintf(f, "<text x=\"14\" y=\"%d\" font-size=\"14\" font-weight=\"bold\" fill=\"#222\" text-anchor=\"middle\" transform=\"rotate(-90 14 %d)\">-Log10(q_value)</text>\n", mt + ph / 2, mt + ph / 2);
+
+            /* Points, three tiers -- drawn not-significant first, q<=0.05 last, so the
+             * most important points are never hidden under the bulk of the cloud. */
+            typedef struct { int g; double x, y; int tier; int clamped; } VPoint; /* tier: 0=ns, 1=p, 2=q;
+                clamped: was |x| reduced to fit xmax_abs -- used to flip label direction inward for
+                these points specifically, since a label growing further outward from an
+                already-at-the-edge point runs off the plot entirely (see the labeling loop below) */
+            VPoint *pts = xmalloc(sizeof(VPoint) * (size_t)n_de_genes);
+            int n_pts = 0;
+            int n_omitted_offscale = 0;
             for (int g = 0; g < n_de_genes; g++) {
                 if (!de_results[g].pass_filter) continue;
-                double xv = de_results[g].log2FoldChange; if (xv > xmax_abs) xv = xmax_abs; if (xv < -xmax_abs) xv = -xmax_abs;
-                double neglog = de_results[g].pvalue > 0 ? -log10(de_results[g].pvalue) : ymax;
+                double xv = de_results[g].log2FoldChange;
+                double q = de_results[g].padj;
+                /* Genes whose |log2FC| exceeds the plot's range are OMITTED here, not
+                 * clamped to the edge -- clamping would draw them at a specific x
+                 * position implying "this gene's fold-change is about xmax_abs," which
+                 * is actively misleading for exactly the genes likely to have wild,
+                 * low-count-driven unshrunk MLE estimates in the first place (the reason
+                 * xmax_abs is now a 99th-percentile bound rather than a plain max --
+                 * see above). Independent filtering (pass_filter) optimizes for
+                 * statistical power, not plot readability, so it does NOT reliably keep
+                 * these unstable estimates out; this omission is this plot's own,
+                 * separate honesty check, on top of that. Never applied to q<=0.05
+                 * genes -- a gene significant enough to survive multiple-testing
+                 * correction has real support behind its estimate almost by
+                 * construction, so it's never silently dropped, only ever plotted. */
+                if (fabs(xv) > xmax_abs && !(!isnan(q) && q <= 0.05)) { n_omitted_offscale++; continue; }
+                int was_clamped = 0;
+                if (xv > xmax_abs) { xv = xmax_abs; was_clamped = 1; }
+                if (xv < -xmax_abs) { xv = -xmax_abs; was_clamped = 1; }
+                double p = de_results[g].pvalue;
+                /* q == 0 exactly -> most significant, not least -- see the matching note
+                 * in the axis-scale loop above for why (this is the same bug, fixed the
+                 * same way, in the loop that actually places points rather than the one
+                 * that only sizes the axis). */
+                double neglog = isnan(q) ? 0 : (q > 0 ? -log10(q) : 300);
+                if (isnan(q)) neglog = 0; /* independent-filtering dropouts have no padj --
+                                              plot at the baseline rather than skip them
+                                              entirely, same "still visible, clearly not
+                                              significant" treatment the not-significant
+                                              tier gets */
                 if (neglog > ymax) neglog = ymax;
-                int cx = x0 + (int)((pw / 2) * (xv / xmax_abs));
-                int cy = mt + ph - (int)(ph * (neglog / ymax));
-                int sig = !isnan(de_results[g].padj) && de_results[g].padj < 0.1;
-                fprintf(f, "<circle cx=\"%d\" cy=\"%d\" r=\"2.2\" fill=\"%s\" fill-opacity=\"%s\"/>\n",
-                        cx, cy, sig ? "#d64550" : "#888", sig ? "0.85" : "0.35");
+                int tier = 0;
+                if (!isnan(q) && q <= 0.05) tier = 2;
+                else if (p <= 0.05) tier = 1;
+                pts[n_pts].g = g; pts[n_pts].x = xv; pts[n_pts].y = neglog; pts[n_pts].tier = tier;
+                pts[n_pts].clamped = was_clamped;
+                n_pts++;
             }
-            fprintf(f, "</svg>\n</div>\n<p class=\"note\">-log10(p-value) vs. log2FoldChange, unshrunk MLE (no apeglm/ashr LFC shrinkage -- "
-                       "same as DESeq2's results() before calling lfcShrink()). Red = significant at FDR &lt; 0.1.</p>\n");
+            const char *tier_color[3] = { "#111111", "#f48fb1", "#e53222" };
+            const char *tier_alpha[3] = { "0.55", "0.75", "0.95" };
+            for (int tier = 0; tier <= 2; tier++) {
+                for (int i = 0; i < n_pts; i++) {
+                    if (pts[i].tier != tier) continue;
+                    int cx = x0 + (int)((pw / 2) * (pts[i].x / xmax_abs));
+                    int cy = y_base - (int)(ph * (pts[i].y / ymax));
+                    fprintf(f, "<circle cx=\"%d\" cy=\"%d\" r=\"3\" fill=\"%s\" fill-opacity=\"%s\"/>\n",
+                            cx, cy, tier_color[tier], tier_alpha[tier]);
+                }
+            }
+
+            /* Label the top 5 up- and top 5 down-regulated q<=0.05 genes by q-value --
+             * matches the reference layout (a handful of named points per direction,
+             * not every significant gene, which would be unreadable clutter). Label TEXT
+             * y-position is staggered to guarantee readability: strongly differentially
+             * expressed genes routinely tie at the same clamped y (q underflows to
+             * exactly 0 for more than one gene at once, especially with a handful of
+             * genes changing dramatically -- not a rare edge case), and placing every
+             * tied label at the literal same pixel would stack them illegibly. Each
+             * label is pushed down only as far as needed to clear the previous one in
+             * the same up/down group; a label whose point already has room keeps its
+             * true position exactly. */
+            typedef struct { int i; double q; } QRank;
+            QRank *up = xmalloc(sizeof(QRank) * (size_t)n_pts);
+            QRank *down = xmalloc(sizeof(QRank) * (size_t)n_pts);
+            int n_up = 0, n_down = 0;
+            for (int i = 0; i < n_pts; i++) {
+                if (pts[i].tier != 2) continue;
+                double q = de_results[pts[i].g].padj;
+                if (pts[i].x > 0) up[n_up++] = (QRank){ i, q };
+                else if (pts[i].x < 0) down[n_down++] = (QRank){ i, q };
+            }
+            for (int i = 1; i < n_up; i++) { QRank key = up[i]; int j = i-1; while (j>=0 && up[j].q > key.q) { up[j+1]=up[j]; j--; } up[j+1]=key; }
+            for (int i = 1; i < n_down; i++) { QRank key = down[i]; int j = i-1; while (j>=0 && down[j].q > key.q) { down[j+1]=down[j]; j--; } down[j+1]=key; }
+            int n_label_up = n_up < 5 ? n_up : 5, n_label_down = n_down < 5 ? n_down : 5;
+            const int LABEL_MIN_GAP = 14; /* px, roughly one line height at this font size */
+            for (int side = 0; side < 2; side++) {
+                QRank *arr = side == 0 ? up : down;
+                int n_lab = side == 0 ? n_label_up : n_label_down;
+                int min_next_y = mt + 10; /* top margin -- no label placed above this */
+                for (int i = 0; i < n_lab; i++) {
+                    VPoint *pt = &pts[arr[i].i];
+                    int cx = x0 + (int)((pw / 2) * (pt->x / xmax_abs));
+                    int cy = y_base - (int)(ph * (pt->y / ymax));
+                    int label_y = cy - 6;
+                    if (label_y < min_next_y) label_y = min_next_y;
+                    min_next_y = label_y + LABEL_MIN_GAP;
+                    /* A clamped (off-scale-but-significant) point sits exactly at the
+                     * plot's outer edge -- growing its label further outward (the normal
+                     * direction for this side) runs it straight past the margin and off
+                     * the image. Flip anchor/offset inward for these specifically; every
+                     * other label keeps the normal side-appropriate direction. */
+                    int grow_right = (side == 0) ? !pt->clamped : pt->clamped;
+                    char gname[64]; html_escape(canonical[pt->g].gene_id, gname, sizeof(gname));
+                    fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" font-style=\"italic\" font-weight=\"bold\" "
+                               "fill=\"#111\" text-anchor=\"%s\">%s</text>\n",
+                            cx + (grow_right ? 6 : -6), label_y, grow_right ? "start" : "end", gname);
+                }
+            }
+            free(up); free(down); free(pts);
+
+            /* Legend */
+            int leg_y = h - 14;
+            int leg_x = ml;
+            const char *leg_label[3] = { "Not Significant", "p value &lt;= 0.05", "q value &lt;= 0.05" };
+            const int leg_visual_len[3] = { 16, 16, 16 }; /* rendered character count, NOT strlen(leg_label[]) --
+                the two escaped labels contain "&lt;" (4 raw chars, renders as one "<"), so strlen()
+                would overestimate width and leave an oversized gap after them; all three labels render
+                to 16 characters ("Not Significant", "p value <= 0.05", "q value <= 0.05"), even though
+                their strlen()s differ once escaped */
+            for (int tier = 0; tier <= 2; tier++) {
+                fprintf(f, "<circle cx=\"%d\" cy=\"%d\" r=\"5\" fill=\"%s\"/>\n", leg_x, leg_y, tier_color[tier]);
+                fprintf(f, "<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#333\">%s</text>\n", leg_x + 10, leg_y + 4, leg_label[tier]);
+                leg_x += 15 + (int)(leg_visual_len[tier] * 6.6) + 18;
+            }
+
+            fprintf(f, "</svg>\n</div>\n<p class=\"note\">Each point is one gene passing independent filtering; "
+                       "x = log2FoldChange (unshrunk MLE), y = -log10(padj/q-value). Note the threshold here is "
+                       "q &lt;= 0.05, stricter than the padj &lt; 0.1 this report's results table and other plots "
+                       "use as \"significant\" -- matching the conventional 0.05 threshold this plot style is "
+                       "usually drawn with, not a change to this report's own significance calls elsewhere. "
+                       "\"p value &lt;= 0.05\" (pink) is uncorrected for multiple testing and shown for reference "
+                       "only, not as a second significance tier -- the same distinction DESeq2's own documentation "
+                       "draws between results()'s pvalue and padj columns. The x-axis range is bounded by the 99th "
+                       "percentile of |log2FC| among adequately-expressed genes (baseMean &gt;= 10), not the single "
+                       "largest value over every gene -- a small number of very-low-count genes can otherwise "
+                       "produce huge but statistically unsupported fold-change estimates that would dominate the "
+                       "whole plot's scale. %d non-significant gene(s) with an off-scale estimate under that bound "
+                       "are omitted from this plot rather than misleadingly drawn at the edge (never applies to "
+                       "q &lt;= 0.05 genes, which are always shown, clamped to the edge if needed) -- see "
+                       "gene_counts.tsv/the full results table for their actual values. Labeled genes: the 5 most "
+                       "significant up- and down-regulated genes by q-value.</p>\n", n_omitted_offscale);
         }
 
         /* Results table: top 30 by padj (NA padj sorted last) */

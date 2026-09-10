@@ -1,3 +1,33 @@
 This directory contains sample datasets
 
 Download data files from the following link: https://bioinfogp.cnb.csic.es/files/samples/rnaseq/
+
+$ wget https://bioinfogp.cnb.csic.es/files/samples/rnaseq/RNA-Seq_Sample_Files.zip
+
+$ unzip RNA-Seq_Sample_Files.zip
+
+$ gunzip *.gz
+
+$ ls -ltr
+total 5851803
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336468_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336468_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336469_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336469_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336470_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336470_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336471_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336471_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336472_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336472_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336473_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336473_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336474_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336474_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336475_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336475_2.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336476_1.fastq
+-rw-r--r-- 1 rauta G-80781 331777792 Jan 17  2025 1M_SRR9336476_2.fastq
+-rw-rw-r-- 1 rauta G-80781   2023279 Mar  3  2025 Saccharomyces_cerevisiae.R64-1-1.59.ann.txt
+-rw-rw-r-- 1 rauta G-80781  12360704 Mar  5  2025 Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa
+-rw-rw-r-- 1 rauta G-80781   5856942 Mar  5  2025 Saccharomyces_cerevisiae.R64-1-1.59.gff3

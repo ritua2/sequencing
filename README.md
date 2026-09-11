@@ -269,7 +269,7 @@ pip3 install --user pyBigWig   # pyBigWig itself is rarely its own module;
 
 ### conda/mamba (installs both in one step, and is the easiest route if pyBigWig's C extension gives pip any trouble building from source, or if PEP 668 makes the plain pip3 route more friction than it's worth)
 
-conda install -c bioconda bedtools pybigwig
+```conda install -c bioconda bedtools pybigwig```
 
 
 **Acknowledgement**: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.

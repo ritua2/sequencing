@@ -228,14 +228,12 @@ sudo apt-get update && sudo apt-get install -y samtools
 ### macOS (Homebrew)
 brew install samtools
 
-# HPC cluster with an environment-modules system
-### check what's actually available on yours first:
+### HPC cluster with an environment-modules system - check what is actually available on yours first:
 module spider samtools
 module load samtools          # exact module name varies by cluster
                               # use whatever `module spider` reported
 
-### conda/mamba (works the same way everywhere, including HPC nodes
-### without root or a module system — the most portable option here)
+### conda/mamba (works the same way everywhere, including HPC nodes without root or a module system — the most portable option here)
 conda install -c bioconda samtools
 
 If you already have alignments.sam from a run that completed before samtools was available (exactly the scenario this section exists for), there's no need to re-run the pipeline — sort and index the existing file directly:
@@ -269,11 +267,9 @@ pip3 install --user pyBigWig   # pyBigWig itself is rarely its own module;
                                 # shared Python install (add --break-system-packages
                                 # too if the cluster's Python also enforces PEP 668)
 
-### conda/mamba (installs both in one step, and is the easiest route if
-### pyBigWig's C extension gives pip any trouble building from source, or
-### if PEP 668 makes the plain pip3 route more friction than it's worth)
-conda install -c bioconda bedtools pybigwig
+### conda/mamba (installs both in one step, and is the easiest route if pyBigWig's C extension gives pip any trouble building from source, or if PEP 668 makes the plain pip3 route more friction than it's worth)
 
+conda install -c bioconda bedtools pybigwig
 
 
 **Acknowledgement**: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.

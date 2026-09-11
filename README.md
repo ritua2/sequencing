@@ -223,29 +223,39 @@ Everything in this section is optional — the pipeline builds with nothing but 
 **samtools**
 
 ### Ubuntu/Debian
+```
 sudo apt-get update && sudo apt-get install -y samtools
+```
 
 ### macOS (Homebrew)
+```
 brew install samtools
+```
 
 ### HPC cluster with an environment-modules system - check what is actually available on yours first:
+```
 module spider samtools
 module load samtools          # exact module name varies by cluster
                               # use whatever `module spider` reported
+```
 
 ### conda/mamba (works the same way everywhere, including HPC nodes without root or a module system — the most portable option here)
+```
 conda install -c bioconda samtools
+```
 
 If you already have alignments.sam from a run that completed before samtools was available (exactly the scenario this section exists for), there's no need to re-run the pipeline — sort and index the existing file directly:
-
+```
 samtools sort -o outdir/alignments.sorted.bam outdir/alignments.sam
 samtools index outdir/alignments.sorted.bam
+```
 
 **bedtools + pyBigWig**
 
 Both are required together for the coverage track — bedtools genomecov produces a bedGraph from the sorted BAM (so this also needs samtools to have run first), and the pipeline's own bundled Python snippet uses pyBigWig to convert that bedGraph into a real bigWig file. Verified directly, not just described: this exact install path (apt-get install bedtools + pip3 install pyBigWig) was run in a clean environment and produced a real, valid coverage.bw covering all reference sequences.
 
 ### Ubuntu/Debian
+```
 sudo apt-get install -y bedtools python3-pip
 pip3 install pyBigWig --break-system-packages   # recent Debian/Ubuntu (PEP 668)
                                                  # refuse a plain `pip3 install` outside
@@ -254,19 +264,23 @@ pip3 install pyBigWig --break-system-packages   # recent Debian/Ubuntu (PEP 668)
                                                  # A venv (`python3 -m venv .venv &&
                                                  # source .venv/bin/activate`) avoids
                                                  # needing the flag at all, if preferred.
+```
 
 ### macOS (Homebrew + pip)
+```
 brew install bedtools
 pip3 install pyBigWig
+```
 
 ### HPC cluster (module system)
+```
 module spider bedtools
 module load bedtools
 pip3 install --user pyBigWig   # pyBigWig itself is rarely its own module;
                                 # --user avoids needing write access to a
                                 # shared Python install (add --break-system-packages
                                 # too if the cluster's Python also enforces PEP 668)
-
+```
 ### conda/mamba (installs both in one step, and is the easiest route if pyBigWig's C extension gives pip any trouble building from source, or if PEP 668 makes the plain pip3 route more friction than it's worth)
 
 ```conda install -c bioconda bedtools pybigwig```

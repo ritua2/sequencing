@@ -58,6 +58,7 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -450,6 +451,48 @@ static double em_final_delta = 0.0;
 static void die(const char *msg) {
     fprintf(stderr, "ERROR: %s\n", msg);
     exit(1);
+}
+
+/* Real-world bug this exists to fix: every write_*() function below
+ * assumes outdir already exists and does nothing to create it -- a
+ * user running `rnaseq_pipeline ... outdir/` against a directory that
+ * doesn't exist yet (an extremely natural thing to do; nothing in the
+ * usage text says otherwise) got a bare "ERROR: cannot write
+ * alignments.sam" with no indication that the real problem was the
+ * directory, not the SAM file, seven pipeline stages after starting.
+ * Creates outdir (and any missing parent directories) if it doesn't
+ * already exist, mirroring `mkdir -p` -- implemented with direct
+ * mkdir() calls on each path component rather than shelling out to
+ * `mkdir -p`, specifically to avoid passing a user-supplied path
+ * through a shell at all (a command-line argument containing shell
+ * metacharacters -- spaces are already common in real filesystem
+ * paths -- would otherwise be a real injection risk, not a
+ * hypothetical one). Safe to call on a path that already exists
+ * (EEXIST from any component is not an error); dies with a specific,
+ * actionable message (via strerror) for any other failure, e.g. a
+ * permissions problem or a component that exists but isn't a
+ * directory. */
+static void ensure_dir_exists(const char *path) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", path);
+    size_t len = strlen(buf);
+    while (len > 0 && buf[len - 1] == '/') { buf[len - 1] = '\0'; len--; } /* trailing
+        slash(es) would otherwise make the final mkdir() see an empty last
+        component and fail confusingly */
+    if (len == 0) return; /* "/" or "" -- nothing to create */
+
+    for (size_t i = 1; i <= len; i++) {
+        if (buf[i] != '/' && buf[i] != '\0') continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        if (buf[0] != '\0' && mkdir(buf, 0755) != 0 && errno != EEXIST) {
+            char eb[1200];
+            snprintf(eb, sizeof(eb), "cannot create output directory \"%s\": %s", buf, strerror(errno));
+            die(eb);
+        }
+        buf[i] = saved;
+        if (saved == '\0') break;
+    }
 }
 
 static void *xmalloc(size_t n) {
@@ -4041,7 +4084,7 @@ static void write_sam(const char *outdir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/alignments.sam", outdir);
     FILE *f = fopen(path, "w");
-    if (!f) die("cannot write alignments.sam");
+    if (!f) { char eb[1200]; snprintf(eb, sizeof(eb), "cannot write %s: %s", path, strerror(errno)); die(eb); }
 
     fprintf(f, "@HD\tVN:1.6\tSO:unsorted\n");
     for (int i = 0; i < n_chroms; i++) fprintf(f, "@SQ\tSN:%s\tLN:%ld\n", chroms[i].name, chroms[i].len);
@@ -4217,7 +4260,7 @@ static void write_gene_counts(const char *outdir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/gene_counts.tsv", outdir);
     FILE *f = fopen(path, "w");
-    if (!f) die("cannot write gene_counts.tsv");
+    if (!f) { char eb[1200]; snprintf(eb, sizeof(eb), "cannot write %s: %s", path, strerror(errno)); die(eb); }
 
     fprintf(f, "gene_id\tchrom\tstart\tend\tstrand\tunique_count\teffective_count\n");
     for (int i = 0; i < n_genes; i++)
@@ -4233,7 +4276,7 @@ static void write_qc_report(const char *outdir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/qc_report.txt", outdir);
     FILE *f = fopen(path, "w");
-    if (!f) die("cannot write qc_report.txt");
+    if (!f) { char eb[1200]; snprintf(eb, sizeof(eb), "cannot write %s: %s", path, strerror(errno)); die(eb); }
 
     double sum_gc = 0, sum_q = 0;
     long sum_n = 0;
@@ -4789,7 +4832,7 @@ static void write_summary(const char *outdir, const char *ref_path, const char *
     char path[1024];
     snprintf(path, sizeof(path), "%s/multiqc_summary.txt", outdir);
     FILE *f = fopen(path, "w");
-    if (!f) die("cannot write multiqc_summary.txt");
+    if (!f) { char eb[1200]; snprintf(eb, sizeof(eb), "cannot write %s: %s", path, strerror(errno)); die(eb); }
 
     int step = paired_mode ? 2 : 1;
     long n_units = n_reads / step;
@@ -5865,7 +5908,7 @@ static void write_compare_report(CompareSample *samples, int n_samples, int n_ge
     char path[1024];
     snprintf(path, sizeof(path), "%s/multi_sample_report.html", outdir);
     FILE *f = fopen(path, "w");
-    if (!f) die("cannot write multi_sample_report.html");
+    if (!f) { char eb[1200]; snprintf(eb, sizeof(eb), "cannot write %s: %s", path, strerror(errno)); die(eb); }
 
     /* --- pick the top COMPARE_TOP_N_GENES most-variable genes ---------- */
     int topn = n_genes_canonical < COMPARE_TOP_N_GENES ? n_genes_canonical : COMPARE_TOP_N_GENES;
@@ -6453,6 +6496,8 @@ static int run_compare_mode(int argc, char **argv) {
     int n_samples = argc - 3;
     if (n_samples > MAX_COMPARE_SAMPLES) { fprintf(stderr, "error: at most %d samples supported\n", MAX_COMPARE_SAMPLES); return 1; }
     const char *combined_outdir = argv[argc - 1];
+    ensure_dir_exists(combined_outdir); /* same fix as the default pipeline's main() -- see
+        ensure_dir_exists()'s own comment */
 
     CompareSample *samples = xmalloc(sizeof(CompareSample) * n_samples);
     GeneCountRow *canonical = NULL;
@@ -6713,6 +6758,9 @@ int main(int argc, char **argv) {
         paired_mode = 1; outdir = argv[6];
         snprintf(reads_desc, sizeof(reads_desc), "%s + %s", argv[4], argv[5]);
     } else { usage(argv[0]); return 1; }
+
+    ensure_dir_exists(outdir); /* see this function's own comment -- the exact bug a real
+        user hit: outdir didn't exist yet, and every write_*() below assumed it did */
 
     printf("[1/7] Loading reference + k-mer index (k=%d): %s\n", KMER_LEN, ref_path);
     if (g_max_intron != MAX_INTRON_DEFAULT)

@@ -1,5 +1,6 @@
-This directory contains sample datasets
+This directory contains sample datasets or steps to get the sample datasets.
 
+### Downloading Data
 Download data files from the following link: https://bioinfogp.cnb.csic.es/files/samples/rnaseq/
 
 $ wget https://bioinfogp.cnb.csic.es/files/samples/rnaseq/RNA-Seq_Sample_Files.zip

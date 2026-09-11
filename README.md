@@ -52,9 +52,14 @@ with gzip.open('annotation.gff3.gz','rt') as f, open('annotation.gtf','w') as ou
         out.write(f'{p[0]}\t{p[1]}\tgene\t{p[3]}\t{p[4]}\t.\t{p[6]}\t.\tgene_id \"{m.group(1)}\";\n')
 "
 ```
+
+
 Or
 
+
 Use the convert_gff3_to_gtk.py code and run it as below. For the sample dataset, check the link in the the data folder of this repo and download RNA-Seq_Sample_Files. From inside the RNA-Seq_Sample_Files folder, run the following command (assuming that *.py file is in the folder one level up) to convert the *.gff3.gz file into a *.gtf file.
+
+**Assumes:** Python 3 is available; *.gff3.gz is an Ensembl-style GFF3 (this converter is not a general-purpose GFF3 parser — other GFF3 flavors may use different attribute conventions). Skip this step entirely if you already have a GTF.
 
 ```
 python3 ../convert_gff3_to_gtf.py Saccharomyces_cerevisiae.R64-1-1.59.gff3.gz yeast.gtf
@@ -62,7 +67,9 @@ python3 ../convert_gff3_to_gtf.py Saccharomyces_cerevisiae.R64-1-1.59.gff3.gz ye
 
 ## 3. Run
 
-Before running the code, ensure that the input files are available. Also ensure that outdir exists (mkdir outdir).
+Before running the code, ensure that the input files are available. Create an outdir if one does not exists (mkdir outdir).
+
+**Remember to follow the step above to convert your annotation to GTF**, if it's GFF3 (Ensembl-style annotations, e.g. yeast, typically are).
 
 ## SERIAL RUN:
 

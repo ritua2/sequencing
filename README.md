@@ -217,12 +217,7 @@ ground-truth set with deliberate sequencing-error variants; DE stack validated a
 **Memory** (the one dimension checked at more than yeast scale): extrapolated to ~25 GB for a human genome via the optional `--fm-index` path — below STAR's ~30 GB reference figure — but this is an extrapolation from real measurements topping out at 90 Mb, not a validated human-scale run.
 
 **Optional - Installing dependencies**
-Everything in this section is optional — the pipeline builds with nothing but a C compiler and runs to completion with nothing but that, producing every core output (alignments.sam, gene_counts.tsv, report.html, multiqc_summary.txt, and the rest). What's below adds specific extra outputs on top of that; skip whichever you do not need. If a tool below is not on PATH, the pipeline detects that itself, prints a note: (not a warning or error) saying exactly what it is skipping and why, and keeps going — nothing fails or produces incomplete/incorrect output because a tool is missing. The table says exactly what each one buys you, so you can decide before running rather than mid-run:
-
-Tool	Enables	Without it
-samtools	Sorted, indexed BAM (alignments.sorted.bam + .bai)	alignments.sam is still written in full — sort and index it yourself later (see below), or use it as-is with any tool that reads SAM directly
-bedtools and Python 3 with pyBigWig (both required together)	Genome coverage track as bigWig (coverage.bw)	No coverage track at all — this one has no manual fallback the way samtools does
-Python 3 (standard library only — no packages)	Only needed if your annotation is GFF3, not GTF (convert_gff3_to_gtf.py, run once before the pipeline)	Not needed at all if you already have a GTF
+Everything in this section is optional — the pipeline builds with nothing but a C compiler and runs to completion with nothing but that, producing every core output (alignments.sam, gene_counts.tsv, report.html, multiqc_summary.txt, and the rest). What's below adds specific extra outputs on top of that; skip whichever you do not need. If a tool below is not on PATH, the pipeline detects that itself, prints a note: (not a warning or error) saying exactly what it is skipping and why, and keeps going — nothing fails or produces incomplete/incorrect output because a tool is missing. 
 
 
 **samtools**

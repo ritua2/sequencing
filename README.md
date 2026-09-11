@@ -1,6 +1,14 @@
+A **single-file, C re-implementation** of the core analytical workflow used by [`nf-core/rnaseq`](https://github.com/nf-core/rnaseq)
+— FASTQ QC/trimming, UMI extraction/dedup, splice-aware alignment, EM-based gene quantification, a DESeq2-equivalent differential
+expression stack, and self-contained HTML/SVG reporting. No aligner, no R, no Bioconductor, no Nextflow required for basic run — it compiles with `gcc` and runs
+anywhere a C compiler exists.
+
+**Validated on:** yeast (*S. cerevisiae*, ~12 Mb). **Not validated on** human/mouse-scale genomes or against real biological (non-technical) replicates.
+
 Here's how to build and run the code in this repo:
 
 ## 1. Compile
+**Assumes:** a C compiler (`gcc`) is available, and you're running the command from the directory containing `rnaseq_pipeline.c`
 
 ```bash
 gcc -O2 -o rnaseq_pipeline rnaseq_pipeline.c -lm
@@ -11,6 +19,20 @@ Or with OpenMP for multi-core parallelism (worth using if your machine has more 
 ```bash
 gcc -O2 -fopenmp -o rnaseq_pipeline rnaseq_pipeline.c -lm
 ```
+
+That's the whole build — no external libraries beyond the C standard library and libm. Everything below is optional and only adds specific
+extra outputs on top of a working default run:
+
+| Tool | Adds | Install | Assumes |
+|---|---|---|---|
+| `samtools` | Sorted, indexed BAM | `apt install samtools` / `brew install samtools` / `conda install -c bioconda samtools` | `apt` needs `sudo`; `brew` needs [Homebrew](https://brew.sh) already installed; `conda` needs conda/mamba already installed |
+| `bedtools` + Python 3 `pyBigWig` | bigWig coverage track | `apt install bedtools` + `pip3 install pyBigWig --break-system-packages` (or `conda install -c bioconda bedtools pybigwig`) | Same as above, plus Python 3 + `pip3` already present |
+| Python 3 (stdlib only) | GFF3→GTF conversion, if your annotation isn't already a GTF | Already on virtually any Linux/macOS/HPC system | — |
+
+If a tool above isn't on `PATH`, the pipeline detects that itself, prints a `note:` explaining what it's skipping, and keeps going —
+nothing fails because a tool is missing. Full multi-platform install commands (HPC module systems, macOS, troubleshooting `pip`'s
+"externally-managed-environment" error) are in [IMPLEMENTATION_DETAILS.md](IMPLEMENTATION_DETAILS.md#installing-dependencies).
+
 
 ## 2. Annotation format — one thing to watch for
 

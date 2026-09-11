@@ -67,7 +67,9 @@ python3 ../convert_gff3_to_gtf.py Saccharomyces_cerevisiae.R64-1-1.59.gff3.gz ye
 
 ## 3. Run
 
-Before running the code, ensure that the input files are available. Create an outdir if one does not exists (mkdir outdir).
+Before running the code, ensure that the input files are available. Create an outdir if one does not exists (mkdir outdir). 
+
+Note: In the latest version of the C code, `outdir/` is created automatically if it doesn't exist.
 
 **Remember to follow the step above to convert your annotation to GTF**, if it's GFF3 (Ensembl-style annotations, e.g. yeast, typically are).
 
@@ -93,7 +95,7 @@ Using the sample data set downloaded from the link in the data directory of this
 
 ```
 time ./rnaseq_pipeline RNA-Seq_Sample_Files/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa RNA-Seq_Sample_Files/yeast.gtf pe RNA-Seq_Sample_Files/1M_SRR9336468_1.fastq RNA-Seq_Sample_Files/1M_SRR9336468_2.fastq ./outdir/
-```
+``` 
 
 ## PARALLEL RUN
 Set the OMP_NUM_THREADS variable to the number of threads that you would like to run the code with to reduce the overall run-time.

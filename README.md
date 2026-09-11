@@ -186,7 +186,7 @@ work); they are required — with **at least 2 sample directories per label** �
 
 Produces `combined_outdir/multi_sample_report.html`: PCA, hierarchical clustering, and — with the `:label` condition tags shown above — a full differential expression table with a volcano plot.
 
-## Comparison with nf-core/rnaseq and other tools
+## 8. Comparison with nf-core/rnaseq and other tools
 
 nf-core/rnaseq orchestrates ~20 external tools (FastQC, Trim Galore!, STAR, Salmon, RSEM, HISAT2, SAMtools, UMI-tools, picard, RSeQC, Qualimap, dupRadar, Preseq, DESeq2, MultiQC...) behind a Nextflow interface. This repo reimplements the analytically central stages natively in C:
 

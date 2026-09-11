@@ -314,7 +314,7 @@ sudo apt-get update && sudo apt-get install -y samtools
 # macOS (Homebrew)
 brew install samtools
 
-# HPC cluster with an environment-modules system (TACC and similar) --
+# HPC cluster with an environment-modules system --
 # check what's actually available on yours first:
 module spider samtools
 module load samtools          # exact module name varies by cluster --

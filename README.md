@@ -217,5 +217,5 @@ ground-truth set with deliberate sequencing-error variants; DE stack validated a
 **Memory** (the one dimension checked at more than yeast scale): extrapolated to ~25 GB for a human genome via the optional `--fm-index` path — below STAR's ~30 GB reference figure — but this is an extrapolation from real measurements topping out at 90 Mb, not a validated human-scale run.
 
 
-Acknowledgement: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.
+**Acknowledgement**: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.
 

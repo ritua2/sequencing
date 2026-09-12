@@ -32,7 +32,7 @@ extra output on top of a working default run:
 If a tool above isn't on `PATH`, the pipeline detects that itself, prints a `note:` explaining what it's skipping, and keeps going —
 nothing fails because a tool is missing. Following are commands to install the optional tools on different platforms:
 
-**Installing Samtools**
+### Installing Samtools
 
 #### Ubuntu/Debian
 ```
@@ -51,7 +51,7 @@ module load samtools          # exact module name varies by cluster
                               # use whatever `module spider` reported
 ```
 
-#### conda/mamba (works the same way everywhere, including HPC nodes without root or a module system — the most portable option here)
+#### Conda/Mamba (works the same way everywhere, including HPC nodes without root or a module system)
 ```
 conda install -c bioconda samtools
 ```
@@ -62,7 +62,7 @@ samtools sort -o outdir/alignments.sorted.bam outdir/alignments.sam
 samtools index outdir/alignments.sorted.bam
 ```
 
-### bedtools + pyBigWig
+### Installing bedtools + pyBigWig
 
 Both are required together for the coverage track — bedtools genomecov produces a bedGraph from the sorted BAM (so this also needs samtools to have run first), and the pipeline's own bundled Python snippet uses pyBigWig to convert that bedGraph into a real bigWig file. 
 
@@ -93,7 +93,7 @@ pip3 install --user pyBigWig   # pyBigWig itself is rarely its own module;
                                 # shared Python install (add --break-system-packages
                                 # too if the cluster's Python also enforces PEP 668)
 ```
-#### conda/mamba (installs both in one step, and is the easiest route if pyBigWig's C extension gives pip any trouble building from source, or if PEP 668 makes the plain pip3 route more friction than it's worth)
+#### Conda/Mamba (installs both in one step)
 
 ```conda install -c bioconda bedtools pybigwig```
 

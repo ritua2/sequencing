@@ -21,7 +21,7 @@ gcc -O2 -fopenmp -o rnaseq_pipeline rnaseq_pipeline.c -lm
 ```
 
 That's the whole build — no external libraries beyond the C standard library and libm. Everything below is optional and only adds specific
-extra outputs on top of a working default run:
+extra output on top of a working default run:
 
 | Tool | Adds | Install | Assumes |
 |---|---|---|---|

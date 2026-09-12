@@ -30,8 +30,73 @@ extra output on top of a working default run:
 | Python 3 (stdlib only) | GFF3→GTF conversion, if your annotation isn't already a GTF | Already on virtually any Linux/macOS/HPC system | — |
 
 If a tool above isn't on `PATH`, the pipeline detects that itself, prints a `note:` explaining what it's skipping, and keeps going —
-nothing fails because a tool is missing. Full multi-platform install commands (HPC module systems, macOS, troubleshooting `pip`'s
-"externally-managed-environment" error) are in [IMPLEMENTATION_DETAILS.md](IMPLEMENTATION_DETAILS.md#installing-dependencies).
+nothing fails because a tool is missing. Following are commands to install the optional tools on different platforms:
+
+**Installing Samtools**
+
+#### Ubuntu/Debian
+```
+sudo apt-get update && sudo apt-get install -y samtools
+```
+
+#### macOS (Homebrew)
+```
+brew install samtools
+```
+
+#### HPC cluster with an environment-modules system - check what is actually available on yours first:
+```
+module spider samtools
+module load samtools          # exact module name varies by cluster
+                              # use whatever `module spider` reported
+```
+
+#### conda/mamba (works the same way everywhere, including HPC nodes without root or a module system — the most portable option here)
+```
+conda install -c bioconda samtools
+```
+
+If you already have alignments.sam from a run that completed before samtools was available (exactly the scenario this section exists for), there's no need to re-run the pipeline — sort and index the existing file directly:
+```
+samtools sort -o outdir/alignments.sorted.bam outdir/alignments.sam
+samtools index outdir/alignments.sorted.bam
+```
+
+### bedtools + pyBigWig
+
+Both are required together for the coverage track — bedtools genomecov produces a bedGraph from the sorted BAM (so this also needs samtools to have run first), and the pipeline's own bundled Python snippet uses pyBigWig to convert that bedGraph into a real bigWig file. 
+
+#### Ubuntu/Debian
+```
+sudo apt-get install -y bedtools python3-pip
+pip3 install pyBigWig --break-system-packages   # recent Debian/Ubuntu (PEP 668)
+                                                 # refuse a plain `pip3 install` outside
+                                                 # a virtual environment -- this flag is
+                                                 # what its own error message asks for.
+                                                 # A venv (`python3 -m venv .venv &&
+                                                 # source .venv/bin/activate`) avoids
+                                                 # needing the flag at all, if preferred.
+```
+
+#### macOS (Homebrew + pip)
+```
+brew install bedtools
+pip3 install pyBigWig
+```
+
+#### HPC cluster (module system)
+```
+module spider bedtools
+module load bedtools
+pip3 install --user pyBigWig   # pyBigWig itself is rarely its own module;
+                                # --user avoids needing write access to a
+                                # shared Python install (add --break-system-packages
+                                # too if the cluster's Python also enforces PEP 668)
+```
+#### conda/mamba (installs both in one step, and is the easiest route if pyBigWig's C extension gives pip any trouble building from source, or if PEP 668 makes the plain pip3 route more friction than it's worth)
+
+```conda install -c bioconda bedtools pybigwig```
+
 
 
 ## 2. Annotation format — one thing to watch for
@@ -215,76 +280,6 @@ nf-core/rnaseq orchestrates ~20 external tools (FastQC, Trim Galore!, STAR, Salm
 ground-truth set with deliberate sequencing-error variants; DE stack validated against DESeq2-style synthetic ground truth.
 
 **Memory** (the one dimension checked at more than yeast scale): extrapolated to ~25 GB for a human genome via the optional `--fm-index` path — below STAR's ~30 GB reference figure — but this is an extrapolation from real measurements topping out at 90 Mb, not a validated human-scale run.
-
-**Optional - Installing dependencies**
-Everything in this section is optional — the pipeline builds with nothing but a C compiler and runs to completion with nothing but that, producing every core output (alignments.sam, gene_counts.tsv, report.html, multiqc_summary.txt, and the rest). What's below adds specific extra outputs on top of that; skip whichever you do not need. If a tool below is not on PATH, the pipeline detects that itself, prints a note: (not a warning or error) saying exactly what it is skipping and why, and keeps going — nothing fails or produces incomplete/incorrect output because a tool is missing. 
-
-
-**samtools**
-
-### Ubuntu/Debian
-```
-sudo apt-get update && sudo apt-get install -y samtools
-```
-
-### macOS (Homebrew)
-```
-brew install samtools
-```
-
-### HPC cluster with an environment-modules system - check what is actually available on yours first:
-```
-module spider samtools
-module load samtools          # exact module name varies by cluster
-                              # use whatever `module spider` reported
-```
-
-### conda/mamba (works the same way everywhere, including HPC nodes without root or a module system — the most portable option here)
-```
-conda install -c bioconda samtools
-```
-
-If you already have alignments.sam from a run that completed before samtools was available (exactly the scenario this section exists for), there's no need to re-run the pipeline — sort and index the existing file directly:
-```
-samtools sort -o outdir/alignments.sorted.bam outdir/alignments.sam
-samtools index outdir/alignments.sorted.bam
-```
-
-**bedtools + pyBigWig**
-
-Both are required together for the coverage track — bedtools genomecov produces a bedGraph from the sorted BAM (so this also needs samtools to have run first), and the pipeline's own bundled Python snippet uses pyBigWig to convert that bedGraph into a real bigWig file. Verified directly, not just described: this exact install path (apt-get install bedtools + pip3 install pyBigWig) was run in a clean environment and produced a real, valid coverage.bw covering all reference sequences.
-
-### Ubuntu/Debian
-```
-sudo apt-get install -y bedtools python3-pip
-pip3 install pyBigWig --break-system-packages   # recent Debian/Ubuntu (PEP 668)
-                                                 # refuse a plain `pip3 install` outside
-                                                 # a virtual environment -- this flag is
-                                                 # what its own error message asks for.
-                                                 # A venv (`python3 -m venv .venv &&
-                                                 # source .venv/bin/activate`) avoids
-                                                 # needing the flag at all, if preferred.
-```
-
-### macOS (Homebrew + pip)
-```
-brew install bedtools
-pip3 install pyBigWig
-```
-
-### HPC cluster (module system)
-```
-module spider bedtools
-module load bedtools
-pip3 install --user pyBigWig   # pyBigWig itself is rarely its own module;
-                                # --user avoids needing write access to a
-                                # shared Python install (add --break-system-packages
-                                # too if the cluster's Python also enforces PEP 668)
-```
-### conda/mamba (installs both in one step, and is the easiest route if pyBigWig's C extension gives pip any trouble building from source, or if PEP 668 makes the plain pip3 route more friction than it's worth)
-
-```conda install -c bioconda bedtools pybigwig```
-
 
 **Acknowledgement**: Claude/Sonnet 5.0 was leveraged in the process of developing and testing this code.
 
